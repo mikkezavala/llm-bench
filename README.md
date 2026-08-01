@@ -1,5 +1,8 @@
 # Mikke Zavala :: KV cache and context depth on a gfx1151 iGPU
 
+> [!TIP]
+> Visit the Interactive Dashboard: [https://mikkezavala.github.io/llm-bench/](https://mikkezavala.github.io/llm-bench/)
+
 Throughput measurements for four models people run locally for coding, on an **AMD Ryzen
 AI MAX+ 395 w/ Radeon 8060S** (gfx1151, 128 GB unified memory), across five KV cache type
 pairs and two context depths, recorded under both the ROCm and the Vulkan build of
