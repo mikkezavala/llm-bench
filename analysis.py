@@ -2,11 +2,11 @@
 
 Run interactively::
 
-    marimo edit notebooks/analysis.py
+    marimo edit analysis.py
 
 Or execute the whole thing headlessly, which is what CI does::
 
-    python notebooks/analysis.py
+    python analysis.py
 """
 
 import marimo
@@ -31,14 +31,12 @@ def _():
         kv_contrast,
         load_runs,
         model_catalog,
-        summarize,
-        to_wide,
-    )
-    from llmbench.plots import (
         plot_backend_ratio,
         plot_depth_scaling,
         plot_kv_penalty,
         plot_kv_sensitivity,
+        summarize,
+        to_wide,
         use_study_style,
     )
 

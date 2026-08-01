@@ -11,6 +11,13 @@ that choice moves throughput far more than the backend does. This write-up is a 
 what I measured and what I think it means, not a benchmark ranking — see
 [Limitations](#limitations) before reusing any number here.
 
+> **Status: ongoing.** This is a working notebook, not a finished paper. Runs are still
+> coming in, several dimensions are only partly covered, and more factors are yet to be
+> added. Nothing here is a conclusion — the observations below are what the data currently
+> shows on one machine, and they are expected to move as the dataset grows. Every figure and
+> number on this page is regenerated from the raw log on each build, so the write-up and the
+> data cannot silently drift apart.
+
 ## Snapshot
 
 | | |
@@ -157,37 +164,59 @@ These are the reasons not to treat this as a benchmark.
 ## Repository layout
 
 ```
-data/results.jsonl        raw llama-bench output — append-only, never edited
-notebooks/analysis.py     the study, as a marimo notebook
-src/llmbench/             analysis helpers
-  schema.py               field names, factor orderings, design constants
-  loading.py              JSONL -> tidy and wide DataFrames
-  validation.py           the integrity audit
-  contrasts.py            paired contrasts and summaries
-  plots.py                figures
-scripts/render_figures.py regenerates figures/ and prints the numbers quoted above
-tests/                    tests for the loading, contrast and audit logic
-figures/                  generated — do not edit by hand
+data/results.jsonl   raw llama-bench output — append-only, never edited
+analysis.py          the study, as a marimo notebook
+llmbench.py          loading, the integrity audit, paired contrasts, figures
+build_site.py        builds the published site into site/
+test_llmbench.py     tests for the loading, contrast and audit logic
+figures/             generated — do not edit by hand
 ```
+
+Nothing here is packaged for distribution: the helpers are one module imported by the
+notebook, so `pyproject.toml` declares dependencies and nothing else.
 
 ## Running it
 
 ```bash
-uv sync --extra dev            # or: uv pip install -e '.[dev]'
+uv sync --extra dev --extra site
 
-marimo edit notebooks/analysis.py   # explore interactively
-python notebooks/analysis.py        # execute headlessly, as CI does
-python scripts/render_figures.py    # refresh figures/ and print the headline numbers
-pytest                              # 39 tests
+marimo edit analysis.py   # explore interactively
+python analysis.py        # execute headlessly, as CI does
+python llmbench.py        # refresh figures/ and print the headline numbers
+pytest                    # tests for the loading, contrast and audit logic
 ruff check .
 ```
 
+## The site
+
+This write-up is published with GitHub Pages by `.github/workflows/deploy.yml`, which lints,
+runs the tests, and then builds the site:
+
+```bash
+python build_site.py --out site
+python -m http.server -d site 8000     # preview at http://localhost:8000
+```
+
+The build re-renders the figures and **executes the notebook against the current data**, so a
+published page cannot show a figure or a table that disagrees with the log in the same commit.
+The site carries the write-up, the executed notebook with its code, and `results.jsonl` itself
+so anything on the page can be re-derived.
+
+The test suite is deliberately part of the deploy path: it asserts that the raw log has no
+blocking audit findings, so a dataset with a structural defect fails the build instead of
+being published.
+
+The notebook is exported by executing it and rendering the results, rather than with
+`marimo export html-wasm`. WASM runs the notebook in Pyodide in the reader's browser, which
+cannot import the local `llmbench` package or read the local JSONL log — and `marimo export
+html` only embeds results from a previously saved editor session, so from a clean CI checkout
+it would publish code with no outputs at all.
+
 The notebook is a marimo notebook, which means it is a plain Python file rather than JSON:
-it diffs readably in git, imports the helper modules directly, and runs as a script. Its cells
+it diffs readably in git, imports the helpers directly, and runs as a script. Its cells
 form a dependency graph rather than a linear sequence, so a cell cannot silently depend on
 another one having been run first — a class of bug the earlier Jupyter version of this
 analysis did have.
 
-After appending new runs to `data/results.jsonl`, re-run `scripts/render_figures.py`: it
-reprints every number quoted in this README, which makes it obvious when the write-up has
-gone stale.
+After appending new runs to `data/results.jsonl`, re-run `python llmbench.py`: it reprints
+every number quoted in this README, which makes it obvious when the write-up has gone stale.

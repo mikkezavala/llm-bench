@@ -18,3 +18,6 @@ wheels/
 
 # marimo
 __marimo__/
+
+# Generated site — built by build_site.py, published from CI
+site/

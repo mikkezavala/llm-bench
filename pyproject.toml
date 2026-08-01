@@ -18,22 +18,23 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.9",
 ]
+site = [
+    "markdown>=3.7",
+    # `marimo export ipynb` needs this to write the executed notebook the site
+    # renderer reads; marimo does not depend on it itself.
+    "nbformat>=5.10",
+]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/llmbench"]
+[tool.uv]
+# This is an analysis repo, not a distributable library: nothing imports it from
+# outside the working tree, so there is no wheel to build and no build backend.
+package = false
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
 addopts = "-q"
 
 [tool.ruff]
 line-length = 90
-src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -43,4 +44,6 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 [tool.ruff.lint.per-file-ignores]
 # A marimo cell displays the value of its last expression, so a bare trailing
 # name is the output of the cell rather than dead code.
-"notebooks/*.py" = ["B018"]
+"analysis.py" = ["B018"]
+# The tests exercise parsing helpers directly, including private ones.
+"test_llmbench.py" = ["SLF001"]

@@ -1,0 +1,72 @@
+name: Deploy study site
+
+on:
+  push:
+    branches: [main]
+    # A data refresh or a change to the analysis should republish; a change to
+    # tooling config should not.
+    paths:
+      - "data/**"
+      - "*.py"
+      - "README.md"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let an in-flight deploy finish rather than cancelling it, so a published site
+# is never left half-updated.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra site
+
+      - name: Lint
+        run: uv run ruff check .
+
+      # Gates the deploy on data integrity: the suite asserts that the raw log
+      # has no blocking audit findings, so a broken dataset cannot be published.
+      - name: Test
+        run: uv run pytest
+
+      - name: Build site
+        run: uv run python build_site.py --out site
+
+      - uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
