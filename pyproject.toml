@@ -1,0 +1,46 @@
+[project]
+name = "llmbench-gfx1151"
+version = "0.1.0"
+description = "A study of llama.cpp ROCm vs Vulkan throughput on an AMD Ryzen AI MAX+ 395 (gfx1151) iGPU"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "marimo>=0.23.16",
+    "matplotlib>=3.11.1",
+    "numpy>=2.2",
+    "pandas>=3.0.5",
+    "seaborn>=0.13.2",
+    "tabulate>=0.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llmbench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 90
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# Em dashes and middle dots are deliberate in prose and in plot labels.
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+# A marimo cell displays the value of its last expression, so a bare trailing
+# name is the output of the cell rather than dead code.
+"notebooks/*.py" = ["B018"]
