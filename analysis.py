@@ -27,7 +27,6 @@ def _():
         contrast,
         coverage_matrix,
         depth_contrast,
-        design_factors,
         figure_html,
         find_results,
         kv_contrast,
@@ -52,7 +51,6 @@ def _():
         contrast,
         coverage_matrix,
         depth_contrast,
-        design_factors,
         figure_html,
         find_results,
         kv_contrast,
@@ -266,7 +264,7 @@ def _(mo):
 
 @app.cell
 def _(figure_html, mo, plot_throughput_interactive, wide):
-    mo.iframe(figure_html(plot_throughput_interactive(wide)), height="800px")
+    mo.iframe(figure_html(plot_throughput_interactive(wide)), height="1700px")
     return
 
 
@@ -474,52 +472,6 @@ def _(mo, variant):
     `qwen`, so a contrast between them varies the model and the quantisation
     together.
 
-    ## Measurement 5 — swept runtime knobs
-
-    Anything beyond model, backend, depth and KV type that varies in the log is
-    picked up as a factor automatically, so this section fills itself in as soon
-    as such a sweep is recorded. `use_mmap` is the next one intended.
-    """)
-    return
-
-
-@app.cell
-def _(as_table, contrast, design_factors, mo, runs, summarize, wide):
-    _extra = design_factors(runs)[4:]
-    if _extra:
-        _knob = _extra[0]
-        _swept = contrast(wide, _knob)
-        _view = mo.vstack(
-            [
-                mo.md(
-                    f"**`{_knob}`** is being swept: "
-                    f"{sorted(runs[_knob].unique())}, "
-                    f"{len(_swept)} paired configurations against "
-                    f"`{_swept['baseline'].iloc[0]}`, every other factor held fixed."
-                ),
-                summarize(_swept, ["bench_backend", "metric", "level"]),
-                as_table(_swept),
-            ]
-        )
-    else:
-        _view = mo.md(
-            """
-            /// attention | No runtime knob is swept yet
-            All 11 sweepable knobs are constant in this snapshot, so there is
-            nothing to contrast here. Recording runs that differ in `use_mmap`
-            (or any other knob) makes it a factor: it joins the configuration
-            key, every other contrast starts holding it fixed, and this section
-            reports it.
-            ///
-            """
-        )
-    _view
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
     ## Limitations
 
     * **One repetition per test.** `stddev_ts` is 0 by construction.

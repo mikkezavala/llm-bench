@@ -591,21 +591,62 @@ def _check_test_shapes(runs: pd.DataFrame, audit: Audit) -> None:
         audit.add(OK, "test shapes", f"metrics measured: {shapes}")
 
 
+def measurement_protocols(runs: pd.DataFrame) -> dict[object, list[str]]:
+    """Metrics measured at each depth, in the order :func:`metric_columns` uses.
+
+    Prefill length is chosen per batch, so different depths can carry different
+    ``pp*`` metrics by design. Completeness is judged inside a depth, not against
+    the union of every metric that appears anywhere in the log.
+    """
+    protocols: dict[object, list[str]] = {}
+    for depth, group in runs.groupby("bench_depth", sort=True):
+        present = set(group["test_type"].unique())
+        ordered = metric_columns(to_wide(group))
+        protocols[depth] = [metric for metric in ordered if metric in present]
+    return protocols
+
+
 def _check_metric_completeness(runs: pd.DataFrame, audit: Audit) -> None:
-    wide = to_wide(runs)
-    metrics = metric_columns(wide)
-    incomplete = wide[wide[metrics].isna().any(axis=1)]
-    if incomplete.empty:
+    protocols = measurement_protocols(runs)
+    incomplete: list[str] = []
+    for depth, expected in protocols.items():
+        wide = to_wide(runs[runs["bench_depth"] == depth])
+        missing = wide[wide[expected].isna().any(axis=1)]
+        if not missing.empty:
+            incomplete.append(
+                f"depth {depth}: {len(missing)} configs missing from {expected}"
+            )
+
+    distinct = {tuple(metrics) for metrics in protocols.values()}
+    protocol_note = "; ".join(
+        f"d{depth}→{metrics}" for depth, metrics in protocols.items()
+    )
+    if len(distinct) > 1:
+        audit.add(
+            CAVEAT,
+            "measurement protocols",
+            "prefill length is not the same at every depth — "
+            f"{protocol_note}. Prefill ratios across depths with different "
+            "pp sizes are not the same test; tg128 is the decode metric shared "
+            "by every depth",
+        )
+    else:
+        metrics = next(iter(distinct)) if distinct else []
+        audit.add(
+            OK,
+            "measurement protocols",
+            f"every depth measures the same metrics: {list(metrics)}",
+        )
+
+    if incomplete:
+        audit.add(BLOCKER, "metric completeness", "; ".join(incomplete))
+    else:
+        parts = [f"d{depth}: {metrics}" for depth, metrics in protocols.items()]
         audit.add(
             OK,
             "metric completeness",
-            f"every one of {len(wide)} configs has all of {metrics}",
-        )
-    else:
-        audit.add(
-            BLOCKER,
-            "metric completeness",
-            f"{len(incomplete)} configs are missing at least one metric",
+            "within each depth, every config has that depth's metrics "
+            f"({'; '.join(parts)})",
         )
 
 
@@ -792,6 +833,32 @@ def as_table(contrasts: pd.DataFrame, decimals: int = 1) -> pd.DataFrame:
 #: Fixed colour per backend so it means the same thing in every figure.
 BACKEND_COLORS = {"rocm": "#c1443c", "vulkan": "#2f6f9f"}
 
+#: One colour per (model, depth) series. Four models × five depths need more
+#: than a four-colour model palette — shared hues with only a dash to separate
+#: depths is what made the KV line plots unreadable.
+_SERIES_PALETTE = [
+    "#e41a1c",
+    "#377eb8",
+    "#4daf4a",
+    "#984ea3",
+    "#ff7f00",
+    "#a65628",
+    "#f781bf",
+    "#66c2a5",
+    "#fc8d62",
+    "#8da0cb",
+    "#e78ac3",
+    "#a6d854",
+    "#ffd92f",
+    "#e5c494",
+    "#1b9e77",
+    "#d95f02",
+    "#7570b3",
+    "#e7298a",
+    "#666666",
+    "#1a1a1a",
+]
+
 #: Colour saturates beyond a 2x change in either direction. Ratios in this study
 #: span 0.44x to 90x; letting the extremes set the scale renders every ordinary
 #: difference as indistinguishable white. The exact ratio is annotated in each
@@ -800,6 +867,56 @@ RATIO_CLIP_LOG2 = 1.0
 
 _CBAR_LABEL = "log2(ratio), clipped at ±1 (2x) — red = slower, blue = faster"
 _TS_FORMATTER = FuncFormatter(lambda v, _: f"{v:g}")
+
+
+def series_key(model: object, depth: object) -> str:
+    """Legend label for one (model, depth) line on a KV throughput plot."""
+    return f"{model} @ d{depth}"
+
+
+def series_palette(keys: list[str]) -> dict[str, str]:
+    """Stable distinct colour for every series key."""
+    ordered = sorted(keys)
+    return {
+        key: _SERIES_PALETTE[i % len(_SERIES_PALETTE)] for i, key in enumerate(ordered)
+    }
+
+
+def protocol_frames(wide: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+    """Split ``wide`` into measurement-protocol slices (shallow triplet / deep pair).
+
+    Depths that share the same non-null metric set belong together. Prefill
+    ratios across those groups are not the same test, so figures that would
+    overlay them are easier to read — and harder to misread — when split.
+    """
+    metrics = metric_columns(wide)
+    groups: dict[tuple[str, ...], list[object]] = {}
+    for depth, sub in wide.groupby("bench_depth", sort=True):
+        present = tuple(metric for metric in metrics if sub[metric].notna().any())
+        groups.setdefault(present, []).append(depth)
+
+    frames: list[tuple[str, pd.DataFrame]] = []
+    for present, depths in groups.items():
+        prefills = [metric for metric in present if metric.startswith("pp")]
+        if set(prefills) == {"pp512", "pp1024"}:
+            name = "shallow (pp512 / pp1024 / tg128)"
+        elif set(prefills) == {"pp2048"}:
+            name = "deep (pp2048 / tg128)"
+        else:
+            name = " / ".join(present)
+        frames.append((name, wide[wide["bench_depth"].isin(depths)].copy()))
+    return frames
+
+
+def depth_contrasts_by_protocol(wide: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+    """Paired depth contrasts computed inside each protocol, never across them."""
+    out: list[tuple[str, pd.DataFrame]] = []
+    for name, frame in protocol_frames(wide):
+        if frame["bench_depth"].nunique() < 2:
+            continue
+        baseline = sorted(frame["bench_depth"].unique())[0]
+        out.append((name, contrast(frame, "bench_depth", baseline=baseline)))
+    return out
 
 
 def use_study_style() -> None:
@@ -842,30 +959,29 @@ def _log_throughput_axis(ax: plt.Axes) -> None:
     ax.yaxis.set_minor_formatter(FuncFormatter(lambda v, _: ""))
 
 
-def plot_kv_sensitivity(wide: pd.DataFrame) -> plt.Figure:
+def plot_kv_sensitivity(wide: pd.DataFrame, *, title: str | None = None) -> plt.Figure:
     """Throughput against KV cache type, one row per metric, one column per backend.
 
-    Reading across a row shows how differently the two backends respond to the
-    same KV configuration.
+    Each (model, depth) series gets its own colour. Marker shape still tracks the
+    model so two close curves stay separable even when colours are similar in print.
     """
-    metrics = metric_columns(wide)
+    metrics = [metric for metric in metric_columns(wide) if wide[metric].notna().any()]
     backends = sorted(wide["bench_backend"].unique())
     order = kv_order(wide)
-    depths = sorted(wide["bench_depth"].unique())
     models = sorted(wide["bench_model"].unique())
-
-    # Models within a family can trace nearly identical curves. Colour alone would
-    # hide one under the other, so each model also gets its own marker and a
-    # slightly narrower line than the one before it, leaving the wider line
-    # visible underneath as a halo.
-    palette = dict(zip(models, sns.color_palette("colorblind"), strict=False))
+    keys = [
+        series_key(model, depth)
+        for model, depth in wide[["bench_model", "bench_depth"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
+    ]
+    palette = series_palette(keys)
     markers = dict(zip(models, ["o", "s", "^", "D", "v", "P"], strict=False))
-    widths = {model: 3.0 - 0.7 * i for i, model in enumerate(models)}
 
     fig, axes = plt.subplots(
         len(metrics),
         len(backends),
-        figsize=(6.2 * len(backends), 4.2 * len(metrics)),
+        figsize=(7.2 * len(backends), 4.8 * len(metrics)),
         sharey="row",
         squeeze=False,
     )
@@ -876,16 +992,19 @@ def plot_kv_sensitivity(wide: pd.DataFrame) -> plt.Figure:
             sub = wide[wide["bench_backend"] == backend]
             for (model, depth), group in sub.groupby(["bench_model", "bench_depth"]):
                 group = group.set_index("bench_kv").reindex(order).reset_index()
+                if group[metric].isna().all():
+                    continue
+                label = series_key(model, depth)
                 ax.plot(
                     group["bench_kv"],
                     group[metric],
                     marker=markers[model],
-                    color=palette[model],
-                    linestyle="-" if depth == depths[0] else "--",
-                    markersize=5,
-                    linewidth=max(widths[model], 1.0),
-                    alpha=0.9,
-                    label=f"{model} @ d{depth}",
+                    color=palette[label],
+                    linestyle="-",
+                    markersize=6,
+                    linewidth=2.0,
+                    alpha=0.95,
+                    label=label,
                 )
             ax.set_title(f"{backend} — {metric_label(metric)}")
             ax.set_xlabel("KV cache type (K / V)")
@@ -893,8 +1012,6 @@ def plot_kv_sensitivity(wide: pd.DataFrame) -> plt.Figure:
             ax.tick_params(axis="x", rotation=20)
             _log_throughput_axis(ax)
 
-    # Collect handles from every panel, not just the first: a series measured on
-    # only one backend would otherwise be missing from the legend entirely.
     merged: dict[str, object] = {}
     for row_axes in axes:
         for ax in row_axes:
@@ -905,15 +1022,17 @@ def plot_kv_sensitivity(wide: pd.DataFrame) -> plt.Figure:
         list(map(merged.get, labels)),
         labels,
         loc="lower center",
-        ncol=min(len(labels), 4),
-        bbox_to_anchor=(0.5, -0.04),
+        ncol=min(len(labels), 5),
+        bbox_to_anchor=(0.5, -0.02),
+        fontsize=9,
     )
     fig.suptitle(
-        "Throughput by KV cache type — log scale, so small values stay readable",
+        title
+        or "Throughput by KV cache type — log scale, so small values stay readable",
         fontsize=13,
         fontweight="bold",
     )
-    fig.tight_layout(rect=(0, 0.02, 1, 0.97))
+    fig.tight_layout(rect=(0, 0.04, 1, 0.97))
     return fig
 
 
@@ -953,6 +1072,13 @@ def _attach_ratio_colorbar(fig: plt.Figure, ax: plt.Axes) -> None:
     fig.colorbar(ax.collections[0], cax=cbar_ax, label=_CBAR_LABEL)
 
 
+def _heatmap_row_count(contrasts: pd.DataFrame) -> int:
+    return max(
+        1,
+        contrasts[["bench_model", "bench_depth"]].drop_duplicates().shape[0],
+    )
+
+
 def plot_backend_ratio(backend_contrasts: pd.DataFrame) -> plt.Figure:
     """Per-configuration ratio between the two backend builds, one panel per metric.
 
@@ -962,20 +1088,31 @@ def plot_backend_ratio(backend_contrasts: pd.DataFrame) -> plt.Figure:
     """
     metrics = sorted(backend_contrasts["metric"].unique())
     order = kv_order(backend_contrasts)
+    n_rows = _heatmap_row_count(backend_contrasts)
+    # Four metrics in one row made each panel too short to read; wrap at 2.
+    ncols = 2 if len(metrics) > 2 else max(len(metrics), 1)
+    nrows = (len(metrics) + ncols - 1) // ncols
+    panel_h = max(6.5, 0.62 * n_rows)
 
     fig, axes = plt.subplots(
-        1, len(metrics), figsize=(7.0 * len(metrics), 4.2), squeeze=False
+        nrows,
+        ncols,
+        figsize=(7.4 * ncols, panel_h * nrows),
+        squeeze=False,
     )
     for i, metric in enumerate(metrics):
+        ax = axes[i // ncols][i % ncols]
         sub = backend_contrasts[backend_contrasts["metric"] == metric]
         matrix = sub.pivot_table(
             index=["bench_model", "bench_depth"],
             columns="bench_kv",
             values="log2_ratio",
         ).reindex(columns=[kv for kv in order if kv in set(sub["bench_kv"])])
-        _ratio_heatmap(axes[0][i], matrix, title=metric_label(metric))
-        axes[0][i].set_xlabel("KV cache type (K / V)")
-        axes[0][i].set_ylabel("model, context depth" if i == 0 else "")
+        _ratio_heatmap(ax, matrix, title=metric_label(metric))
+        ax.set_xlabel("KV cache type (K / V)")
+        ax.set_ylabel("model, context depth" if i % ncols == 0 else "")
+    for j in range(len(metrics), nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
 
     baseline = backend_contrasts["baseline"].iloc[0]
     level = backend_contrasts["level"].iloc[0]
@@ -985,7 +1122,7 @@ def plot_backend_ratio(backend_contrasts: pd.DataFrame) -> plt.Figure:
         fontsize=13,
         fontweight="bold",
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     _attach_ratio_colorbar(fig, axes[0][0])
     return fig
 
@@ -995,11 +1132,12 @@ def plot_kv_penalty(kv_contrasts: pd.DataFrame) -> plt.Figure:
     metrics = sorted(kv_contrasts["metric"].unique())
     backends = sorted(kv_contrasts["bench_backend"].unique())
     order = kv_order(kv_contrasts, column="level")
+    row_h = max(4.2, 0.38 * _heatmap_row_count(kv_contrasts))
 
     fig, axes = plt.subplots(
         len(backends),
         len(metrics),
-        figsize=(6.0 * len(metrics), 3.6 * len(backends)),
+        figsize=(5.4 * len(metrics), row_h * len(backends)),
         squeeze=False,
     )
     for row, backend in enumerate(backends):
@@ -1032,11 +1170,14 @@ def plot_kv_penalty(kv_contrasts: pd.DataFrame) -> plt.Figure:
     return fig
 
 
-def plot_depth_scaling(depth_contrasts: pd.DataFrame) -> plt.Figure:
-    """Throughput change from the shallowest to the deeper context, per backend.
+def plot_depth_scaling(
+    depth_contrasts: pd.DataFrame, *, title: str | None = None
+) -> plt.Figure:
+    """Throughput change from the protocol baseline to deeper contexts.
 
     Only configurations measured at both depths appear, so the bars are true
-    paired comparisons.
+    paired comparisons. Pass one protocol slice at a time — a single figure with
+    every depth against ``d1024`` piles too many y-labels to read.
     """
     metrics = sorted(depth_contrasts["metric"].unique())
     multi_level = depth_contrasts["level"].nunique() > 1
@@ -1045,18 +1186,22 @@ def plot_depth_scaling(depth_contrasts: pd.DataFrame) -> plt.Figure:
     if multi_level:
         frame["config"] += " → d" + frame["level"].astype(str)
 
-    # Order rows by model, then by KV type in interpretable order, so the baseline
-    # sits at the top of each model's block.
     ranks = {kv: i for i, kv in enumerate(kv_order(frame))}
     row_order = (
         frame.assign(_rank=frame["bench_kv"].map(ranks))
-        .sort_values(["bench_model", "_rank"])["config"]
+        .sort_values(["bench_model", "_rank", "level"])["config"]
         .unique()
         .tolist()
     )
+    # Grow with the number of y-labels so names stay readable.
+    fig_h = max(5.0, 0.38 * len(row_order) + 1.8)
 
     fig, axes = plt.subplots(
-        1, len(metrics), figsize=(6.4 * len(metrics), 4.6), sharey=True, squeeze=False
+        1,
+        len(metrics),
+        figsize=(6.8 * len(metrics), fig_h),
+        sharey=True,
+        squeeze=False,
     )
     for i, metric in enumerate(metrics):
         ax = axes[0][i]
@@ -1071,8 +1216,9 @@ def plot_depth_scaling(depth_contrasts: pd.DataFrame) -> plt.Figure:
         )
         ax.axvline(0, color="black", linewidth=0.8)
         ax.set_title(metric_label(metric))
-        ax.set_xlabel("change vs shallowest depth (%)")
+        ax.set_xlabel("change vs protocol baseline (%)")
         ax.set_ylabel("model · KV cache type" if i == 0 else "")
+        ax.tick_params(axis="y", labelsize=9)
         handles, labels = ax.get_legend_handles_labels()
         ax.get_legend().remove()
 
@@ -1082,15 +1228,15 @@ def plot_depth_scaling(depth_contrasts: pd.DataFrame) -> plt.Figure:
         title="backend",
         loc="lower center",
         ncol=len(labels),
-        bbox_to_anchor=(0.5, -0.06),
+        bbox_to_anchor=(0.5, -0.04),
     )
     baseline = depth_contrasts["baseline"].iloc[0]
     fig.suptitle(
-        f"Cost of deeper context, relative to d{baseline}",
+        title or f"Cost of deeper context, relative to d{baseline}",
         fontsize=13,
         fontweight="bold",
     )
-    fig.tight_layout(rect=(0, 0.02, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.94))
     return fig
 
 
@@ -1116,57 +1262,80 @@ def to_long(wide: pd.DataFrame) -> pd.DataFrame:
     ).dropna(subset=["t_s"])
 
 
-def plot_throughput_interactive(wide: pd.DataFrame, height: int = 760) -> go.Figure:
+def plot_throughput_interactive(
+    wide: pd.DataFrame,
+    *,
+    height: int | None = None,
+    title: str | None = None,
+) -> go.Figure:
     """Throughput against KV cache type: one row per metric, one column per backend.
 
-    Colour separates models and dash style separates context depths, matching the
-    static figure. Hover reports every factor of the configuration, so a point can
-    be identified without cross-referencing the legend.
+    Colour is per (model, depth) series — not per model with depth as dash — so
+    five depths do not collapse onto four shared hues. Pass one protocol slice at
+    a time when the full grid is too dense for a single legend.
     """
     import plotly.express as px
 
-    long = to_long(wide)
+    long = to_long(wide).copy()
+    # A protocol slice of ``wide`` still carries the other protocol's metric
+    # columns as all-NaN; faceting on those creates blank rows and a height that
+    # looks like the chart failed to render.
+    metrics = [metric for metric in metric_columns(wide) if wide[metric].notna().any()]
+    long = long[long["metric"].isin(metrics)]
+    long["series"] = [
+        series_key(model, depth)
+        for model, depth in long[["bench_model", "bench_depth"]].itertuples(
+            index=False, name=None
+        )
+    ]
+    palette = series_palette(sorted(long["series"].unique()))
+    if height is None:
+        # Facet rows need real vertical room; a short iframe is why the chart
+        # sometimes looks blank or clipped in the exported page.
+        height = 380 * max(len(metrics), 1) + 180
+
     factors = design_factors(wide)
-    hover = [col for col in factors if col not in {"bench_kv", "bench_model"}]
+    hover = [col for col in factors if col not in {"bench_kv"}]
 
     fig = px.line(
         long,
         x="bench_kv",
         y="t_s",
-        color="bench_model",
-        line_dash="bench_depth",
+        color="series",
         facet_col="bench_backend",
         facet_row="metric",
         markers=True,
         log_y=True,
         height=height,
+        color_discrete_map=palette,
         category_orders={
             "bench_kv": kv_order(wide),
-            "metric": metric_columns(wide),
+            "metric": metrics,
             "bench_backend": _factor_levels(wide, "bench_backend"),
+            "series": sorted(palette),
         },
         hover_data=hover,
         labels={
             "bench_kv": "KV cache type (K / V)",
             "t_s": "tokens/second",
-            "bench_model": "model",
-            "bench_depth": "context depth",
+            "series": "model @ depth",
             "bench_backend": "backend",
         },
     )
-    # Each row is a different metric on a different scale; sharing one y range
-    # would flatten decode against the bottom of the prefill row.
     fig.update_yaxes(matches=None, showticklabels=True)
     fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
     fig.update_layout(
-        legend_title_text="model, depth",
-        margin={"l": 70, "r": 20, "t": 60, "b": 60},
+        legend_title_text="model @ depth",
+        legend={"font": {"size": 11}, "itemsizing": "constant"},
+        margin={"l": 80, "r": 30, "t": 70, "b": 70},
         hovermode="closest",
-        title=(
+        title=title
+        or (
             "Throughput by KV cache type — log axis; "
             "click a legend entry to isolate a series"
         ),
     )
+    fig.update_traces(line={"width": 2.5}, marker={"size": 8})
     return fig
 
 
@@ -1178,20 +1347,40 @@ def figure_html(fig: go.Figure) -> str:
     static page. ``plotly.js`` is loaded from a CDN rather than inlined, which
     keeps the built page around 3 MB rather than 40 MB.
     """
-    return fig.to_html(full_html=True, include_plotlyjs="cdn")
+    return fig.to_html(
+        full_html=True,
+        include_plotlyjs="cdn",
+        config={"responsive": True, "displayModeBar": True},
+    )
+
+
+def iframe_height(fig: go.Figure, *, pad: int = 48) -> str:
+    """CSS height for an iframe wrapping ``fig``, matching its layout height."""
+    height = int(fig.layout.height or 900)
+    return f"{height + pad}px"
 
 
 def render_figures(wide: pd.DataFrame, out: str | Path = DEFAULT_FIGURES) -> list[Path]:
     """Write every figure the write-up references, returning the paths written."""
     use_study_style()
     out = Path(out)
-    figures = {
-        "kv-sensitivity.png": plot_kv_sensitivity(wide),
+    figures: dict[str, plt.Figure] = {
         "kv-penalty.png": plot_kv_penalty(kv_contrast(wide)),
         "backend-ratio.png": plot_backend_ratio(backend_contrast(wide)),
-        "depth-scaling.png": plot_depth_scaling(depth_contrast(wide)),
     }
-    return [savefig(fig, out / name) for name, fig in figures.items()]
+    for name, frame in protocol_frames(wide):
+        slug = "shallow" if name.startswith("shallow") else "deep"
+        figures[f"kv-sensitivity-{slug}.png"] = plot_kv_sensitivity(
+            frame, title=f"Throughput by KV cache type — {name}"
+        )
+    for name, contrasts in depth_contrasts_by_protocol(wide):
+        slug = "shallow" if name.startswith("shallow") else "deep"
+        baseline = contrasts["baseline"].iloc[0]
+        figures[f"depth-scaling-{slug}.png"] = plot_depth_scaling(
+            contrasts,
+            title=f"Cost of deeper context — {name}, relative to d{baseline}",
+        )
+    return [savefig(fig, out / filename) for filename, fig in figures.items()]
 
 
 # ---------------------------------------------------------------------------

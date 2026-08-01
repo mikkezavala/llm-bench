@@ -70,7 +70,7 @@ body {
         "Helvetica Neue", Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
-.wrap { max-width: 900px; margin: 0 auto; padding: 0 24px 96px; }
+.wrap { max-width: 1320px; margin: 0 auto; padding: 0 28px 96px; }
 nav {
   border-bottom: 1px solid var(--border);
   margin-bottom: 40px;
@@ -81,9 +81,9 @@ nav {
   z-index: 10;
 }
 nav .inner {
-  max-width: 900px;
+  max-width: 1320px;
   margin: 0 auto;
-  padding: 0 24px;
+  padding: 0 28px;
   display: flex;
   flex-wrap: wrap;
   gap: 20px;
@@ -185,6 +185,21 @@ footer {
 .output { overflow-x: auto; }
 .output table { font-size: 12.5px; }
 .output table th { position: sticky; top: 0; }
+.output iframe {
+  /* Tall enough for the shallow-protocol Plotly facet (3 metric rows). Marimo's
+     static export drops the iframe height attribute, so CSS has to carry it. */
+  width: 100%;
+  min-height: 1400px;
+  height: 1400px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  display: block;
+  margin: 0.6em 0 1.4em;
+}
+.output img {
+  margin: 1.2em auto;
+}
 .stderr { color: #b3402f; }
 """
 
@@ -354,7 +369,10 @@ def render_notebook(document: dict) -> str:
         if not prose_only:
             code = html.escape(source)
             parts.append(
-                "<details><summary>code</summary>"
+                # Open by default so a plot cell is not mistaken for empty —
+                # the figure sits below, but a closed toggle reads as "nothing
+                # here" when skimming the page.
+                "<details open><summary>code</summary>"
                 f'<pre><code class="language-python">{code}</code></pre></details>'
             )
         if outputs:

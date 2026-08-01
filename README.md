@@ -5,7 +5,7 @@
 
 Throughput measurements for four models people run locally for coding, on an **AMD Ryzen
 AI MAX+ 395 w/ Radeon 8060S** (gfx1151, 128 GB unified memory), across five KV cache type
-pairs and two context depths, recorded under both the ROCm and the Vulkan build of
+pairs and five context depths, recorded under both the ROCm and the Vulkan build of
 `llama.cpp`.
 
 **What this is.** A record of how throughput responds to *configuration* on one machine: which
@@ -36,14 +36,27 @@ and none should be quoted that way.
 | | |
 | --- | --- |
 | Hardware | `cpu_info`: AMD Ryzen AI MAX+ 395 w/ Radeon 8060S (gfx1151), 128 GB unified memory |
-| Builds | `build_commit` `a66d505` / `build_number` 1 for all 80 ROCm records; `d6d899580` / 9747 for all 80 Vulkan records |
+| Builds | `build_commit` `a66d505` / `build_number` 1 for all ROCm records; `d6d899580` / 9747 for all Vulkan records |
 | Reported GPU | `Radeon 8060S Graphics` (ROCm), `Radeon 8060S Graphics (RADV STRIX_HALO)` (Vulkan) |
-| Tests | 160 `llama-bench` records → 80 configurations, 1 record per (configuration, metric) |
-| `test_time` span | 2026-07-31T21:39:58Z to 2026-08-01T03:36:42Z |
-| Metrics | `pp2048` (prompt processing), `tg128` (token generation), both tokens/second |
-| Factors | 4 models × 2 backends × 2 depths (16384, 32768) × 5 KV pairs — fully crossed |
+| Tests | 430 `llama-bench` records → 170 configurations, 1 record per (configuration, metric) |
+| `test_time` span | 2026-07-31T21:39:58Z to 2026-08-01T04:40:38Z |
+| Metrics | prefill `pp512` / `pp1024` / `pp2048` (depends on depth — see below) and decode `tg128`, tokens/second |
+| Factors | 4 models × 2 backends × 5 depths × 5 KV pairs — 30 of 200 cells empty (`d8192` is `agentworld` only so far) |
 | Held constant | 11 runtime knobs: `flash_attn=1`, `use_mmap=True`, `no_kv_offload=False`, `n_batch=1024`, `n_ubatch=512`, `n_threads=8`, `n_gpu_layers=-1`, `n_cpu_moe=0`, `split_mode=layer`, `poll=50`, `embeddings=False` |
 | Repetitions | 1 per test (`samples_ts` has length 1, so `stddev_ts` is 0) |
+
+**Two measurement protocols by depth.** Prefill length is not held constant across the log:
+
+| depths | prefill tests | decode | shape |
+| --- | --- | --- | --- |
+| 1024, 2048, 8192 | `pp512` and `pp1024` | `tg128` | triplet |
+| 16384, 32768 | `pp2048` | `tg128` | pair |
+
+That matters: a prefill ratio that crosses the two groups is not the same test (different
+prompt lengths). `tg128` is the decode metric shared by every depth. Paired contrasts only
+join configurations that actually share a metric, so the pipeline does not invent a
+`pp2048` at `d1024` — but any write-up that pools “prefill” across depths without splitting
+on protocol would.
 
 Models under test, with every field as reported by `llama.cpp` in the log:
 
@@ -73,10 +86,14 @@ below are static because GitHub renders no JavaScript.
 
 ### 1. KV cache type, within each backend
 
-![Throughput by KV cache type](figures/kv-sensitivity.png)
+![Throughput by KV cache type — shallow protocol](figures/kv-sensitivity-shallow.png)
 
-Relative to `f16/f16` at the same model, depth and backend (8 pairs per row, 4 configurations
-× 2 metrics):
+![Throughput by KV cache type — deep protocol](figures/kv-sensitivity-deep.png)
+
+Relative to `f16/f16` at the same model, depth and backend. Ranges below are the **deep
+protocol only** (`d16384` / `d32768`, `pp2048` + `tg128` — 8 pairs per row). The shallow
+triplet depths are in the notebook and figures; pooling them into this table would mix
+different prefill lengths.
 
 | backend | arch | KV pair shape | `pp2048` | `tg128` |
 | --- | --- | --- | --- | --- |
@@ -91,15 +108,15 @@ Relative to `f16/f16` at the same model, depth and backend (8 pairs per row, 4 c
 
 ![Quantised KV cache relative to f16/f16](figures/kv-penalty.png)
 
-The two bold rows are the largest measured effects in the dataset. In absolute terms, the ROCm
-`qwen35moe` asymmetric cells record `pp2048` of 6.2 to 14.8 t/s against 518 to 690 t/s for the
-same configurations at `f16/f16`. The same models and KV pairs under the Vulkan build measure
-within 9 % of their own `f16/f16` reading.
+The two bold rows are the largest measured effects in the deep protocol. In absolute terms, the
+ROCm `qwen35moe` asymmetric cells record `pp2048` of 6.2 to 14.8 t/s against 518 to 690 t/s for
+the same configurations at `f16/f16`. The same models and KV pairs under the Vulkan build
+measure within 9 % of their own `f16/f16` reading.
 
 Not established by these measurements: whether the ROCm asymmetric result reflects a different
 code path, a fallback, something specific to that commit, an interaction with `flash_attn=1`,
-or something else. `flash_attn` is 1 in all 160 records, so this data contains no contrast
-that could separate those possibilities.
+or something else. `flash_attn` is 1 in every record, so this data contains no contrast that
+could separate those possibilities.
 
 ### 2. The same configuration under each build
 
@@ -110,18 +127,22 @@ each cell contains the backend and every other change between those commits, wit
 separate them. It is here because which build handled which KV configuration is a practical
 fact if you are setting this hardware up — not as a ranking.
 
-With KV at `f16/f16` (16 pairs, all four models and both depths) the two builds read within
-**1.070x – 1.229x** of each other. Away from `f16/f16` the ratio is dominated by whichever
-build recorded the large KV effect in section 1: the `qwen35moe` asymmetric cells read
-48.9x – 90.4x, and the `deepseek2` symmetric cells 0.53x – 0.60x. Those are the section 1
-measurements seen from the other side. No single summary ratio is quoted across the table,
-because it would average those two regions together and mean nothing.
+With KV at `f16/f16` the two builds read within roughly **1.01x – 1.28x** of each other across
+the metrics present at each depth. Away from `f16/f16` the ratio is dominated by whichever
+build recorded the large KV effect in section 1. No single summary ratio is quoted across the
+table, because it would average those regions together and mean nothing.
 
-### 3. Context depth, 16384 → 32768
+### 3. Context depth
 
-![Cost of deeper context](figures/depth-scaling.png)
+![Cost of deeper context — shallow protocol](figures/depth-scaling-shallow.png)
 
-Across all 20 configurations per backend, throughput at 32768 relative to 16384:
+![Cost of deeper context — deep protocol](figures/depth-scaling-deep.png)
+
+Five depths are in the log. Prefill length changes with the protocol above, so **depth ratios
+on `pp*` are only comparable inside a protocol**. `tg128` is shared by every depth and is the
+safe cross-depth decode reading.
+
+Deep protocol only — throughput at 32768 relative to 16384 (20 configurations per backend):
 
 | backend | `pp2048` median (range) | `tg128` median (range) |
 | --- | --- | --- |
@@ -133,9 +154,8 @@ separate cleanly: `qwen35moe` measures −18.5 % to −22.8 % on `pp2048` and �
 `tg128`, while `deepseek2` measures −41.3 % to −43.8 % and −25.3 % to −30.1 % on the same two
 metrics. In both architectures `pp2048` falls by more than `tg128`.
 
-Not established by these measurements: the shape of the curve between and beyond these two
-points. Two depths give one slope per configuration and cannot distinguish linear from
-super-linear growth.
+The shallow protocol (`d1024` / `d2048` / `d8192`, with `pp512`/`pp1024`) is in the figures;
+`d8192` is `agentworld` only so far, so any mean over that depth mixes a different model set.
 
 ### 4. Two quantisations of the same model
 
@@ -144,13 +164,14 @@ super-linear growth.
 are the only pair in the log where a contrast varies quantisation with model, backend, depth
 and KV type all held fixed.
 
-Across all **40 paired configurations**, `glm-xl / glm` falls between **0.985x and 1.015x**,
-with medians of 1.008x (`pp2048`) and 1.004x (`tg128`). 35 of the 40 pairs are above 1.000x.
+Across **100 paired configurations** (every depth and every metric both files share),
+`glm-xl / glm` medians are 1.030x (`pp512`), 1.018x (`pp1024`), 1.008x (`pp2048`) and
+1.006x (`tg128`), with the full set spanning roughly 0.985x – 1.083x.
 
-Not established by these measurements: whether that ±1.5 % spread or the 35/40 direction is
-distinguishable from run-to-run variance, which is unmeasured at one repetition per test, or
-from a run-order or thermal offset. Nothing here speaks to output quality, which is the other
-axis on which these two files differ.
+Not established by these measurements: whether that spread or its direction is distinguishable
+from run-to-run variance, which is unmeasured at one repetition per test, or from a run-order
+or thermal offset. Nothing here speaks to output quality, which is the other axis on which
+these two files differ.
 
 `agentworld` is also a `UD` build, but it is a different fine-tune from `qwen`, so a contrast
 between them varies the model and the quantisation together.
@@ -205,16 +226,17 @@ repetition per test supports.
 
 `llmbench.audit_runs` runs before the analysis and states what the data can support. It
 separates *blockers*, which would invalidate a comparison, from *caveats*, which constrain
-interpretation. On the current snapshot: **6 ok, 2 caveats, no blockers.**
+interpretation. On the current snapshot: **5 ok, 4 caveats, no blockers.**
 
 | check | result |
 | --- | --- |
-| machine | ok — `cpu_info` identical across all 160 records |
+| machine | ok — `cpu_info` identical across all 430 records |
 | factors | ok — 4 factors; 11 other runtime knobs constant |
 | uniqueness | ok — exactly one record per (configuration, metric) |
-| test shapes | ok — `pp2048` and `tg128` only |
-| metric completeness | ok — all 80 configurations have both metrics |
-| design balance | ok — fully crossed |
+| test shapes | ok — `pp512`, `pp1024`, `pp2048`, `tg128` |
+| metric completeness | ok — within each depth, every config has that depth's metrics |
+| measurement protocols | **caveat** — prefill length differs by depth (triplet vs pair) |
+| design balance | **caveat** — 30 of 200 cells empty (`d8192` is `agentworld` only) |
 | replication | **caveat** — 1 repetition per test; run-to-run variance unmeasured |
 | build provenance | **caveat** — the two backends are different commits, so the two are not a controlled comparison |
 
@@ -234,10 +256,12 @@ same physical device under different names.
   snapshot says nothing about them.
 - **Throughput only.** No perplexity or task accuracy. Nothing here indicates whether a KV
   cache quantisation that costs no throughput costs output quality.
-- **Two depths.** 16384 and 32768 only.
+- **Two prefill protocols.** Shallow depths use `pp512`/`pp1024`; deep depths use `pp2048`.
+  Prefill ratios across that split are not the same test.
+- **`d8192` is incomplete.** Only `agentworld` is present at that depth so far.
 - **5 of 9 K/V type pairs.** `f16/f16`, `f16/q8_0`, `f16/q4_0`, `q8_0/q8_0`, `q4_0/q4_0`.
 - **One machine, sequential runs.** Run order is not randomised and thermal state is not
-  recorded, so drift over the ~6 hour `test_time` span is not controlled for.
+  recorded, so drift over the `test_time` span is not controlled for.
 - **Two architectures, two models each.** Every statement grouped by `qwen35moe` or
   `deepseek2` rests on two models, one of which is a `UD` variant of the other in the
   `deepseek2` case.
@@ -247,12 +271,12 @@ same physical device under different names.
 These are unresolved by the current data, listed with the contrast that would address each.
 
 1. Does the ROCm `qwen35moe` asymmetric-KV result persist with `flash_attn=0`? The factor is
-   constant at 1 in all 160 records, so this log cannot say.
+   constant at 1 in every record, so this log cannot say.
 2. What does `use_mmap` do here, on a machine with unified memory and models in the
    16–21 GiB range?
-3. Is the ±1.5 % `glm-xl` / `glm` difference reproducible? Repeated interleaved runs would show
-   whether the 35/40 direction holds or resolves into noise.
-4. What is the shape of the depth curve? More depths would distinguish a slope from a curve.
+3. Is the `glm-xl` / `glm` difference reproducible across repetitions?
+4. With five depths now in the log, what does the `tg128` curve look like once `d8192` is
+   filled for every model — and should prefill be plotted only within each protocol?
 5. Does the `deepseek2` / `qwen35moe` split hold with more models per architecture, or is it a
    property of these four files?
 6. Do the KV cache quantisations that cost little throughput cost output quality? This
