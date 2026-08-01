@@ -34,7 +34,7 @@ from pathlib import Path
 import markdown
 import matplotlib
 
-from llmbench import CONFIG_COLS, find_results, load_runs, render_figures, to_wide
+from llmbench import design_factors, find_results, load_runs, render_figures, to_wide
 
 REPO_URL = "https://github.com/mikkezavala/llm-bench"
 
@@ -370,7 +370,19 @@ def main() -> None:
     parser.add_argument("--skip-figures", action="store_true")
     args = parser.parse_args()
 
-    results = find_results(__file__)
+    try:
+        results = find_results(__file__)
+    except FileNotFoundError:
+        # Every page is derived from the log, so there is nothing to publish
+        # without it. Said plainly here, because the alternative is a traceback
+        # in a CI log that looks like a code fault rather than a missing input.
+        sys.exit(
+            "build_site: data/results.jsonl not found.\n"
+            "Every figure and table on the site is derived from it, so there is "
+            "nothing to build without it.\n"
+            "It is currently excluded from git by .git/info/exclude; commit it, "
+            "or build the site locally instead of in CI."
+        )
     root = results.parent.parent
     out = args.out
     if out.exists():
@@ -397,7 +409,7 @@ def main() -> None:
         "style": STYLE,
         "repo": REPO_URL,
         "n_tests": len(runs),
-        "n_configs": runs.groupby(CONFIG_COLS).ngroups,
+        "n_configs": runs.groupby(design_factors(runs)).ngroups,
         "first": runs["test_time"].min(),
         "last": runs["test_time"].max(),
         "built": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),

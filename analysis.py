@@ -27,14 +27,17 @@ def _():
         contrast,
         coverage_matrix,
         depth_contrast,
+        design_factors,
+        figure_html,
         find_results,
         kv_contrast,
         load_runs,
+        missing_cells,
         model_catalog,
         plot_backend_ratio,
         plot_depth_scaling,
         plot_kv_penalty,
-        plot_kv_sensitivity,
+        plot_throughput_interactive,
         summarize,
         to_wide,
         use_study_style,
@@ -49,15 +52,18 @@ def _():
         contrast,
         coverage_matrix,
         depth_contrast,
+        design_factors,
+        figure_html,
         find_results,
         kv_contrast,
         load_runs,
+        missing_cells,
         mo,
         model_catalog,
         plot_backend_ratio,
         plot_depth_scaling,
         plot_kv_penalty,
-        plot_kv_sensitivity,
+        plot_throughput_interactive,
         summarize,
         to_wide,
     )
@@ -66,18 +72,25 @@ def _():
 @app.cell
 def _(mo):
     mo.md(r"""
-    # KV cache types, ROCm and Vulkan on a gfx1151 iGPU
+    # KV cache and context depth on a gfx1151 iGPU
 
-    A study of `llama.cpp` throughput on an **AMD Ryzen AI MAX+ 395 w/ Radeon
-    8060S** (gfx1151, 128 GB unified memory), comparing the **ROCm** and
-    **Vulkan** backends across KV cache quantisation types, two context
-    depths, and four MoE models — including two Unsloth Dynamic (`UD`)
-    quantisations.
+    Throughput measurements for four models people actually run locally for
+    coding, on an **AMD Ryzen AI MAX+ 395 w/ Radeon 8060S** (gfx1151, 128 GB
+    unified memory), across five KV cache type pairs and two context depths,
+    recorded under both the ROCm and the Vulkan build of `llama.cpp`.
 
-    The question I started with was "which backend is faster". The data
-    answered a more useful question instead: **which KV cache configurations
-    each backend handles well**, because that choice moves throughput by far
-    more than the backend does.
+    **What this is.** A record of how throughput responds to *configuration* on
+    one machine: KV cache type, context depth, and which model is loaded.
+
+    **What this is not.** A comparison of ROCm against Vulkan. The two builds
+    are from different `llama.cpp` commits made days apart, so a difference
+    between them cannot be attributed to the backend rather than to everything
+    else that changed between those commits. Results are reported per backend,
+    within each backend, and are not ranked against each other.
+
+    This notebook also does not explain *why* any measured difference occurs.
+    Where a measurement has more than one possible explanation, the
+    alternatives are left open.
 
     Read the audit section before quoting any number from here.
     """)
@@ -88,6 +101,14 @@ def _(mo):
 def _(find_results, load_runs):
     runs = load_runs(find_results(__file__))
     return (runs,)
+
+
+@app.cell
+def _(runs):
+    # Architecture token of `model_type`, per model label. Summaries below group
+    # by it because the measurements separate along that line.
+    families = dict(zip(runs["bench_model"], runs["family"], strict=True))
+    return (families,)
 
 
 @app.cell
@@ -126,10 +147,9 @@ def _(mo):
     mo.md(r"""
     ## Audit
 
-    This is the part that decides what the rest of the notebook is allowed to
-    say. Each check either passes, raises a **caveat** that constrains
-    interpretation, or raises a **blocker** that would invalidate the
-    analysis.
+    This is the part that bounds what the rest of the notebook can say. Each
+    check either passes, raises a **caveat** that constrains interpretation, or
+    raises a **blocker** that would invalidate a comparison.
     """)
     return
 
@@ -138,28 +158,31 @@ def _(mo):
 def _(audit_runs, runs):
     audit = audit_runs(runs)
     audit.to_frame()
-    return
+    return (audit,)
 
 
 @app.cell
-def _(mo):
-    mo.md(r"""
-    Three caveats carry through everything below, and they are the reason this
-    notebook reports ratios with ranges instead of single headline numbers:
+def _(audit, mo):
+    _caveats = len(audit.to_frame().query("severity == 'caveat'"))
+    mo.md(f"""
+    **{len(audit.blockers)} blockers, {_caveats} caveats.** The caveats above
+    carry through everything below, and they are why ratios are reported as
+    ranges rather than single figures:
 
-    1. **One repetition per test.** `stddev_ts` is zero by construction, so
-       run-to-run variance is unknown. Differences of a few percent are not
-       distinguishable from noise, and no percentage here should be read to
-       two decimal places.
-    2. **Backend is confounded with build.** The ROCm runs come from one
-       `llama.cpp` commit and the Vulkan runs from another. Any ROCm/Vulkan
-       difference is a difference between *these two builds on this machine*,
-       not a property of the backends in general.
-    3. **The design is not fully crossed.** Some model/depth/KV cells were
-       never run. An unpaired mean over the whole table would silently compare
-       different sets of conditions, so every comparison below is computed
-       pairwise *within* a configuration, and pairs with a missing side are
-       dropped rather than filled in.
+    * **One repetition per test.** `stddev_ts` is zero by construction, so
+      run-to-run variance is unmeasured. Differences of a few percent are not
+      separable from noise, and no percentage here should be read to two
+      decimal places.
+    * **The two builds are not a controlled comparison.** ROCm and Vulkan
+      records carry different `build_commit` values, from commits made days
+      apart, and no record varies one while holding the other fixed. Nothing
+      below reads across the two builds as a backend comparison.
+
+    Every comparison below is computed pairwise *within* a configuration: one
+    factor varies, all other factors are held fixed, and a pair with a missing
+    side is dropped rather than filled in. The factor list is derived from the
+    log, so sweeping a new runtime knob adds it to the configuration key rather
+    than being averaged over.
     """)
     return
 
@@ -171,11 +194,12 @@ def _(coverage_matrix, runs):
 
 
 @app.cell
-def _(mo):
-    mo.md(r"""
-    Each cell above counts tests: `2` means both prefill and decode were
-    measured, `0` means the cell was never run. The gaps are concentrated in
-    the GLM models at 32k depth.
+def _(missing_cells, mo, runs):
+    _absent = len(missing_cells(runs))
+    mo.md(f"""
+    Each cell above counts tests: `2` means both metrics were measured, `0`
+    means the cell was never run. Unmeasured cells in the factorial design:
+    **{_absent}**.
 
     ## The measurements
 
@@ -220,19 +244,29 @@ def _(kv_filter, model_filter, wide):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Observation 1 — each backend has its own KV cache cliff
+    ## Measurement 1 — KV cache type, within each backend
 
-    The KV cache type is the single largest lever in this dataset, and the two
-    backends fail on *opposite* configurations. Note the log y-axis: on a
-    linear axis the ROCm collapse flattens against the bottom of the plot and
-    reads as missing data.
+    KV cache type is the factor associated with the largest measured spread in
+    this dataset. Note the log y-axis: on a linear axis the smallest values
+    flatten against the bottom of the plot and read as missing data.
+
+    Click a legend entry to hide or isolate a series, and hover any point for
+    the exact configuration and throughput. Each panel is one backend and one
+    metric; compare *within* a panel.
+
+    Models are grouped by the architecture token of `model_type` —
+    `qwen35moe` (`qwen`, `agentworld`) and `deepseek2` (`glm`, `glm-xl`) —
+    because the measurements separate along that line. `f16/q8_0` and
+    `f16/q4_0` are labelled **asymmetric** (`f16` keys, quantised values);
+    `q8_0/q8_0` and `q4_0/q4_0` are **symmetric**. Those are descriptions of
+    the K/V pair, not of a mechanism.
     """)
     return
 
 
 @app.cell
-def _(plot_kv_sensitivity, wide):
-    plot_kv_sensitivity(wide)
+def _(figure_html, mo, plot_throughput_interactive, wide):
+    mo.iframe(figure_html(plot_throughput_interactive(wide)), height="800px")
     return
 
 
@@ -249,33 +283,35 @@ def _(kv, plot_kv_penalty):
 
 
 @app.cell
-def _(kv, summarize):
-    summarize(kv, ["bench_backend", "metric", "level"])
+def _(families, kv, summarize):
+    summarize(
+        kv.assign(arch=kv["bench_model"].map(families)),
+        ["bench_backend", "arch", "kv_class", "metric"],
+    )
     return
 
 
 @app.cell
-def _(mo):
-    mo.md(r"""
-    Reading those two views together:
+def _(kv, mo):
+    _worst = kv.nsmallest(1, "ratio").iloc[0]
+    mo.md(f"""
+    Each row of the table above is 8 pairs: 2 models × 2 depths × 2 KV pairs of
+    that shape, each compared against `f16/f16` at the same model, depth and
+    backend.
 
-    * **ROCm, asymmetric KV (`f16` keys with a quantised value cache).** The
-      `qwen35moe` models lose roughly **98 % of prefill throughput** and about
-      **80 % of decode** — around 690 t/s down to 14 t/s at 16k. This is not a
-      gradual cost, it is a cliff, and its size is the signature of falling
-      off an optimised attention path rather than of arithmetic on smaller
-      types. The `deepseek2` models are untouched by it.
-    * **ROCm, symmetric KV (both caches quantised).** Essentially free for
-      prefill (within 1 % of `f16/f16`) and a modest 6–17 % cost for decode.
-    * **Vulkan, asymmetric KV.** Also close to free — a few percent at most.
-    * **Vulkan, symmetric KV.** Fine for `qwen35moe`, but the `deepseek2`
-      models lose about **half their prefill** and a third of decode.
+    The two largest effects in the dataset fall on different backends *and*
+    different architectures — ROCm with `qwen35moe` under asymmetric KV, and
+    Vulkan with `deepseek2` under symmetric KV. In each case the same models and
+    KV pairs measured on the other backend land close to their own `f16/f16`
+    baseline. The single largest is `{_worst["bench_model"]}` on
+    `{_worst["bench_backend"]}` at depth {_worst["bench_depth"]}, `{_worst["level"]}`:
+    {_worst["metric"]} of {_worst["to"]:.2f} t/s against {_worst["from"]:.2f} t/s
+    at `f16/f16`, a ratio of {_worst["ratio"]:.4f}x.
 
-    So "should I quantise the KV cache" has no backend-independent answer
-    here. On this machine the safe configuration is `f16/f16` for both
-    backends; if the KV cache must shrink, ROCm tolerates symmetric
-    quantisation and Vulkan tolerates asymmetric — exactly the reverse of one
-    another.
+    **Not established by this data.** Whether the ROCm asymmetric result
+    reflects a different code path, a fallback, a build-specific behaviour, an
+    interaction with `flash_attn=1`, or something else. `flash_attn` is 1 in
+    every record, so this log contains no contrast that separates those.
     """)
     return
 
@@ -283,12 +319,17 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Observation 2 — the backend gap is small next to the cliffs
+    ## Measurement 2 — the same configuration under each build
 
-    With the KV cache held at a configuration both backends handle, Vulkan is
-    modestly ahead. Where a cliff is in play, the "ratio" is really measuring
-    the cliff, not the backend — which is why the extreme cells are called out
-    separately rather than folded into an average.
+    The same configuration, read once under the ROCm build and once under the
+    Vulkan build, shown as a per-cell ratio.
+
+    **This is not a backend comparison.** The two builds are different
+    `llama.cpp` commits made days apart, so these ratios contain the backend
+    *and* every other change between the commits, with no way to separate them.
+    It is included because which build handles which KV configuration is a
+    practical fact for anyone running this hardware — not as a ranking, and no
+    single number is quoted across the two.
     """)
     return
 
@@ -306,29 +347,38 @@ def _(backend, plot_backend_ratio):
 
 
 @app.cell
-def _(backend, summarize):
-    summarize(backend, ["metric", "kv_class"])
+def _(backend, families, summarize):
+    summarize(
+        backend.assign(arch=backend["bench_model"].map(families)),
+        ["arch", "kv_class", "metric"],
+    )
     return
 
 
 @app.cell
-def _(mo):
-    mo.md(r"""
-    On the `f16/f16` baseline, Vulkan leads by roughly **9–19 %** on both
-    prefill and decode across all four models. That is a real but ordinary
-    gap, and it is confounded with the build difference noted in the audit.
+def _(backend, mo):
+    _base = backend[backend["bench_kv"] == "f16/f16"]
+    _extreme = backend[backend["ratio"] > 2]
+    _low = backend[backend["ratio"] < 0.75]
+    mo.md(f"""
+    With KV at `f16/f16` — {len(_base)} pairs, all four models and both
+    depths — the two builds read within
+    **{_base["ratio"].min():.3f}x – {_base["ratio"].max():.3f}x** of each other.
 
-    The `51x`–`90x` cells are the ROCm asymmetric-KV collapse seen from the
-    other side, and the `0.56x` cells are the Vulkan symmetric-KV regression
-    on `deepseek2`. Averaging those into a single "Vulkan is N times faster"
-    figure would be meaningless: the median prefill ratio over the whole table
-    is inflated by a bug in one backend and depressed by a different bug in
-    the other.
+    Away from `f16/f16`, {len(_extreme)} pairs read above 2.00x (up to
+    {_extreme["ratio"].max():.1f}x) and {len(_low)} below 0.75x (down to
+    {_low["ratio"].min():.3f}x). Those are the same cells as measurement 1, seen
+    from the other side: they say which build handled which KV configuration,
+    not which backend is faster.
 
-    ## Observation 3 — doubling context costs prefill more than decode
+    **Not established by this data.** How any of this divides between the
+    backend and the rest of what changed between the two commits. Nothing here
+    varies one while holding the other fixed.
 
-    Every pair below is the same model, backend and KV type measured at 16k
-    and then at 32k.
+    ## Measurement 3 — context depth, 16384 → 32768
+
+    Every pair below is the same model, backend and KV type measured at both
+    depths.
     """)
     return
 
@@ -352,25 +402,39 @@ def _(depth, summarize):
 
 
 @app.cell
-def _(mo):
-    mo.md(r"""
-    Going from 16k to 32k depth costs about **18–24 % of prefill** and only
-    **4–9 % of decode** in the healthy configurations — consistent with
-    attention over a longer cache dominating a batched prefill more than it
-    dominates single-token decode.
+def _(depth, mo):
+    def _pct(models, metric):
+        rows = depth[
+            (depth["bench_kv"] == "f16/f16")
+            & depth["bench_model"].isin(models)
+            & (depth["metric"] == metric)
+        ]
+        return f"{rows['pct'].min():+.1f} % to {rows['pct'].max():+.1f} %"
 
-    Two details stand out. The ROCm medians look far worse (about −43 %
-    prefill) because the ROCm column includes the collapsed asymmetric-KV
-    configurations, which degrade *further* with depth: the cliff gets steeper
-    as the cache grows, roughly −55 % on top of an already 50x loss. And
-    `glm` on ROCm drops about 43 % of prefill from 16k to 32k even on
-    `f16/f16`, a much steeper depth curve than the `qwen35moe` models show on
-    the same backend.
+    _qwen = ["qwen", "agentworld"]
+    _glm = ["glm", "glm-xl"]
+    mo.md(f"""
+    The medians above mix architectures and KV types. Restricted to `f16/f16`,
+    the two architectures separate:
 
-    ## Observation 4 — the Unsloth Dynamic variants cost nothing measurable
+    | arch | `pp2048` | `tg128` |
+    | --- | --- | --- |
+    | `qwen35moe` | {_pct(_qwen, "pp2048")} | {_pct(_qwen, "tg128")} |
+    | `deepseek2` | {_pct(_glm, "pp2048")} | {_pct(_glm, "tg128")} |
 
-    `glm` (`Q4_K_M`) and `glm-xl` (`UD-Q4_K_XL`) are the same base model at the
-    same parameter count, so pairing them isolates the quantisation mix.
+    In both architectures `pp2048` falls by more than `tg128` over the same
+    depth change.
+
+    **Not established by this data.** The shape of the curve between and beyond
+    these two points. Two depths give one slope per configuration and cannot
+    distinguish linear from super-linear growth.
+
+    ## Measurement 4 — two quantisations of the same model
+
+    `glm` (`Q4_K_M`) and `glm-xl` (`UD-Q4_K_XL`) report the same `model_type`
+    and the same parameter count, and differ in quantisation and file size.
+    They are the only pair in the log where a contrast varies quantisation with
+    model, backend, depth and KV type all held fixed.
     """)
     return
 
@@ -390,51 +454,107 @@ def _(summarize, variant):
 
 
 @app.cell
+def _(mo, variant):
+    _above = int((variant["ratio"] > 1).sum())
+    mo.md(f"""
+    Across all **{len(variant)} paired configurations**, `glm-xl / glm` falls
+    between **{variant["ratio"].min():.3f}x and {variant["ratio"].max():.3f}x**,
+    with medians of
+    {variant[variant["metric"] == "pp2048"]["ratio"].median():.3f}x (`pp2048`)
+    and {variant[variant["metric"] == "tg128"]["ratio"].median():.3f}x
+    (`tg128`). {_above} of {len(variant)} pairs are above 1.000x.
+
+    **Not established by this data.** Whether that spread or that direction is
+    distinguishable from run-to-run variance, which is unmeasured at one
+    repetition per test, or from a systematic run-order or thermal offset —
+    runs were sequential and run order is not randomised. Nothing here speaks
+    to output quality, the other axis on which these two files differ.
+
+    `agentworld` is also a `UD` build, but it is a different fine-tune from
+    `qwen`, so a contrast between them varies the model and the quantisation
+    together.
+
+    ## Measurement 5 — swept runtime knobs
+
+    Anything beyond model, backend, depth and KV type that varies in the log is
+    picked up as a factor automatically, so this section fills itself in as soon
+    as such a sweep is recorded. `use_mmap` is the next one intended.
+    """)
+    return
+
+
+@app.cell
+def _(as_table, contrast, design_factors, mo, runs, summarize, wide):
+    _extra = design_factors(runs)[4:]
+    if _extra:
+        _knob = _extra[0]
+        _swept = contrast(wide, _knob)
+        _view = mo.vstack(
+            [
+                mo.md(
+                    f"**`{_knob}`** is being swept: "
+                    f"{sorted(runs[_knob].unique())}, "
+                    f"{len(_swept)} paired configurations against "
+                    f"`{_swept['baseline'].iloc[0]}`, every other factor held fixed."
+                ),
+                summarize(_swept, ["bench_backend", "metric", "level"]),
+                as_table(_swept),
+            ]
+        )
+    else:
+        _view = mo.md(
+            """
+            /// attention | No runtime knob is swept yet
+            All 11 sweepable knobs are constant in this snapshot, so there is
+            nothing to contrast here. Recording runs that differ in `use_mmap`
+            (or any other knob) makes it a factor: it joins the configuration
+            key, every other contrast starts holding it fixed, and this section
+            reports it.
+            ///
+            """
+        )
+    _view
+    return
+
+
+@app.cell
 def _(mo):
     mo.md(r"""
-    Across all ten paired configurations the `UD-Q4_K_XL` build lands within
-    about **1 %** of `Q4_K_M` — and interestingly, on prefill it is faster in
-    10 of 10 pairs. A ~1 % gap is well inside what a single repetition can
-    resolve, but a consistent *sign* across ten independent pairs is harder to
-    dismiss as noise, and it points the same way as the file size: `glm-xl` is
-    the smaller model on disk (16.31 GiB vs 17.05 GiB) at identical parameter
-    count.
-
-    The cautious reading is that the dynamic quantisation is
-    throughput-neutral to marginally favourable here, and that the reason to
-    choose it would be memory footprint or output quality — neither of which
-    this study measures. Distinguishing a genuine 1 % edge from a systematic
-    run-order or thermal offset needs interleaved repetitions.
-
-    The other `UD` model, `agentworld`, cannot be used this way: it is a
-    different fine-tune from `qwen`, so a comparison between them mixes the
-    model and the quantisation and cannot separate the two.
-
     ## Limitations
 
-    * **One repetition per test.** The largest effects here are 50x and would
-      survive any plausible variance, but the 9–19 % backend gap and the 1–2 %
-      variant difference genuinely need replication before they mean anything.
-    * **Backend and build are not separated.** Rebuilding both backends from
-      one commit is the single change that would most improve this study.
-    * **Throughput only.** No perplexity, no task accuracy. A KV cache
-      quantisation that is free in tokens/second is not necessarily free in
-      output quality, and nothing here speaks to that.
-    * **Two depths.** 16k and 32k give a slope but not a curve; the shape of
-      depth scaling past 32k is unmeasured.
-    * **One machine, one thermal envelope.** Runs were sequential on a single
-      laptop-class iGPU; sustained-load throttling is not controlled for.
+    * **One repetition per test.** `stddev_ts` is 0 by construction.
+      Differences of a few percent — the `f16/f16` reading between the two
+      builds, the quantisation-variant spread — are not separable from noise.
+    * **The two builds are not a controlled comparison.** No record varies
+      backend and `build_commit` independently.
+    * **`flash_attn` is 1 everywhere.** Nothing here shows how the
+      measurements change without it.
+    * **`use_mmap` and the other runtime knobs are constant.** Not yet swept.
+    * **Throughput only.** No perplexity or task accuracy.
+    * **Two depths.** 16384 and 32768 only.
+    * **5 of 9 K/V type pairs.**
+    * **One machine, sequential runs.** Run order is not randomised and
+      thermal state is not recorded.
+    * **Two architectures, two models each.**
 
-    ## What I would measure next
+    ## Open questions
 
-    1. Rebuild both backends from the same `llama.cpp` commit and re-run, with
-       at least three repetitions per test.
-    2. Fill the missing GLM cells at 32k so the design is fully crossed.
-    3. Isolate the ROCm asymmetric-KV cliff: does it survive with flash
-       attention disabled? That would distinguish an unsupported fused
-       attention path from a general dequantisation cost.
-    4. Add a depth sweep (4k, 8k, 16k, 32k, 64k) to get the shape of the
-       prefill curve rather than two points on it.
+    Unresolved by the current data, with the contrast each would need:
+
+    1. Does the ROCm `qwen35moe` asymmetric-KV result persist with
+       `flash_attn=0`? The factor is constant at 1 in every record.
+    2. What do the two backends read when both are built from the same commit?
+       That is the contrast this log cannot supply.
+    3. What does `use_mmap` do here, on unified memory with models in the
+       16–21 GiB range?
+    4. Is the `glm-xl` / `glm` difference reproducible under repeated,
+       interleaved runs?
+    5. What is the shape of the depth curve? More depths would distinguish a
+       slope from a curve.
+    6. Does the `deepseek2` / `qwen35moe` split hold with more models per
+       architecture, or is it a property of these four files?
+    7. Do the KV cache quantisations that cost little throughput cost output
+       quality? That needs a metric this study does not collect.
     """)
     return
 

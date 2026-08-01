@@ -9,6 +9,7 @@ dropped instead of raising, and results that depended on hardcoded metric names.
 from __future__ import annotations
 
 import json
+from itertools import product
 
 import numpy as np
 import pytest
@@ -74,7 +75,7 @@ def synthetic(tmp_path):
     """
     prefill = {
         ("rocm", "f16/f16"): 100.0,
-        ("rocm", "f16/q4_0"): 10.0,  # 0.10x — a collapse
+        ("rocm", "f16/q4_0"): 10.0,  # 0.10x
         ("vulkan", "f16/f16"): 120.0,  # 1.20x vs rocm
         ("vulkan", "f16/q4_0"): 60.0,  # 0.50x vs vulkan baseline
     }
@@ -113,8 +114,17 @@ def wide(synthetic):
 
 @pytest.fixture(scope="session")
 def study_runs():
-    """The real ``data/results.jsonl``, as loaded for the write-up."""
-    return lb.load_runs(lb.find_results(__file__))
+    """The real ``data/results.jsonl``, as loaded for the write-up.
+
+    Skipped when the log is not present. The log is the author's own benchmark
+    output and is not necessarily committed, so a checkout without it is a valid
+    state — the logic tests above cover the code on synthetic data regardless.
+    """
+    try:
+        path = lb.find_results(__file__)
+    except FileNotFoundError:
+        pytest.skip("data/results.jsonl is not present in this checkout")
+    return lb.load_runs(path)
 
 
 @pytest.fixture(scope="session")
@@ -235,8 +245,88 @@ def test_model_catalog_rejects_an_ambiguous_label(tmp_path):
         lb.model_catalog(lb.load_runs(path))
 
 
-def test_find_results_walks_up_from_a_nested_path():
-    assert lb.find_results(__file__).name == "results.jsonl"
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "/home/someone/.cache/huggingface/hub/models--unsloth--GLM-4.7-Flash-GGUF"
+            "/snapshots/0d32489ecb9db6d2a4fc93bd27ef01519f95474d/GLM-4.7-Flash-Q4_K_M.gguf",
+            "hf://unsloth/GLM-4.7-Flash-GGUF@0d32489ecb9d/GLM-4.7-Flash-Q4_K_M.gguf",
+        ),
+        (
+            "/home/someone/models/Custom-Q4_K_M.gguf",
+            "local://Custom-Q4_K_M.gguf",
+        ),
+        (
+            "hf://unsloth/GLM-4.7-Flash-GGUF@0d32489ecb9d/GLM-4.7-Flash-Q4_K_M.gguf",
+            "hf://unsloth/GLM-4.7-Flash-GGUF@0d32489ecb9d/GLM-4.7-Flash-Q4_K_M.gguf",
+        ),
+    ],
+)
+def test_scrub_path_removes_the_location_and_keeps_the_model(raw, expected):
+    assert lb.scrub_path(raw) == expected
+
+
+def test_scrub_log_leaves_no_home_directory_behind(tmp_path):
+    """The check that matters: no local path may survive anywhere in the file."""
+    path = tmp_path / "raw.jsonl"
+    write_jsonl(
+        path,
+        [
+            make_record(
+                model_filename="/home/someone/.cache/huggingface/hub/"
+                "models--unsloth--GLM-4.7-Flash-GGUF/snapshots/0d32489ecb9d/A-Q4_K_M.gguf"
+            ),
+            make_record(
+                model_filename="/home/someone/models/B-Q4_K_M.gguf",
+                bench_kv="q8_0/q8_0",
+                type_k="q8_0",
+                type_v="q8_0",
+            ),
+        ],
+    )
+    replacements = lb.scrub_log(path)
+    assert len(replacements) == 2
+    assert "/home/" not in path.read_text()
+    assert "someone" not in path.read_text()
+
+
+def test_scrub_log_changes_nothing_but_the_paths(tmp_path):
+    """Field order, spacing and float formatting must survive untouched."""
+    path = tmp_path / "raw.jsonl"
+    write_jsonl(path, [make_record(model_filename="/home/someone/m/A-Q4_K_M.gguf")])
+    before = json.loads(path.read_text())
+    lb.scrub_log(path)
+    after = json.loads(path.read_text())
+    assert list(before) == list(after)
+    assert {k: v for k, v in before.items() if k != "model_filename"} == {
+        k: v for k, v in after.items() if k != "model_filename"
+    }
+
+
+def test_scrub_log_is_idempotent(tmp_path):
+    path = tmp_path / "raw.jsonl"
+    write_jsonl(path, [make_record(model_filename="/home/someone/m/A-Q4_K_M.gguf")])
+    lb.scrub_log(path)
+    once = path.read_text()
+    assert lb.scrub_log(path) == {}
+    assert path.read_text() == once
+
+
+def test_quant_label_survives_a_scrubbed_path():
+    scrubbed = lb.scrub_path(
+        "/home/someone/.cache/huggingface/hub/models--unsloth--GLM-4.7-Flash-GGUF"
+        "/snapshots/0d32489ecb9db6d2a4fc93bd27ef01519f95474d/GLM-4.7-Flash-UD-Q4_K_XL.gguf"
+    )
+    assert lb._quant_label(scrubbed) == "UD-Q4_K_XL"
+
+
+def test_find_results_walks_up_from_a_nested_path(tmp_path):
+    nested = tmp_path / "a" / "b"
+    nested.mkdir(parents=True)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "results.jsonl").write_text("")
+    assert lb.find_results(nested) == tmp_path / "data" / "results.jsonl"
 
 
 def test_find_results_reports_where_it_looked(tmp_path):
@@ -377,11 +467,125 @@ def test_single_build_passes_provenance(tmp_path):
     assert severities(lb.load_runs(path))["build provenance"] == lb.OK
 
 
-def test_a_varying_controlled_knob_is_a_blocker(tmp_path):
-    """Changing thread count mid-study would confound every comparison."""
-    path = tmp_path / "drift.jsonl"
-    write_jsonl(path, [make_record(), make_record(n_threads=16, bench_depth=32768)])
-    assert severities(lb.load_runs(path))["controlled fields"] == lb.BLOCKER
+def test_a_swept_knob_becomes_a_factor(tmp_path):
+    """Sweeping a runtime knob is a study design, not a defect.
+
+    The knob has to join the configuration key, or the pivot averages the two
+    settings into one row and reports a throughput belonging to neither.
+    """
+    path = tmp_path / "mmap.jsonl"
+    write_jsonl(
+        path,
+        [
+            make_record(use_mmap=True, avg_ts=100.0, samples_ts=[100.0]),
+            make_record(use_mmap=False, avg_ts=110.0, samples_ts=[110.0]),
+        ],
+    )
+    runs = lb.load_runs(path)
+    assert "use_mmap" in lb.design_factors(runs)
+    assert severities(runs)["factors"] == lb.OK
+    assert lb.audit_runs(runs).blockers == []
+
+    wide = lb.to_wide(runs)
+    assert len(wide) == 2, "the two mmap settings must stay separate rows"
+    assert sorted(wide["pp2048"]) == [100.0, 110.0]
+
+
+def test_a_harness_only_sweep_becomes_a_factor(tmp_path):
+    """A sweep the harness records but llama-bench does not must still be a factor.
+
+    Otherwise the pivot averages the two settings and the sweep vanishes.
+    """
+    path = tmp_path / "harness.jsonl"
+    write_jsonl(
+        path,
+        [
+            make_record(bench_mmap="on", avg_ts=100.0, samples_ts=[100.0]),
+            make_record(bench_mmap="off", avg_ts=110.0, samples_ts=[110.0]),
+        ],
+    )
+    runs = lb.load_runs(path)
+    assert "bench_mmap" in lb.design_factors(runs)
+    assert len(lb.to_wide(runs)) == 2
+
+
+def test_a_field_restating_another_factor_is_not_counted_twice(tmp_path):
+    """``bench_mmap`` and ``use_mmap`` describing one sweep is one factor, not two.
+
+    Counting both would leave the design looking half empty: 2 x 2 nominal cells
+    for a sweep that only has 2 real ones.
+    """
+    path = tmp_path / "both.jsonl"
+    write_jsonl(
+        path,
+        [
+            make_record(bench_mmap="on", use_mmap=True, avg_ts=100.0, samples_ts=[1.0]),
+            make_record(bench_mmap="off", use_mmap=False, avg_ts=110.0, samples_ts=[1.0]),
+        ],
+    )
+    runs = lb.load_runs(path)
+    factors = lb.design_factors(runs)
+    assert ("bench_mmap" in factors) != ("use_mmap" in factors)
+    assert lb.missing_cells(runs).empty
+
+
+def test_the_kv_halves_are_not_counted_as_extra_factors(study_runs):
+    """``bench_ctk`` / ``bench_ctv`` restate ``bench_kv``, ``bench_block`` the depth."""
+    factors = lb.design_factors(study_runs)
+    assert [col for col in factors if col in lb.DERIVED_BENCH_COLS] == []
+    assert factors == lb.BENCH_COLS
+
+
+def test_a_boolean_knob_is_contrasted_against_its_default(tmp_path):
+    """``use_mmap`` defaults to on, so the pair must read as the cost of turning it off.
+
+    Sorted order would put ``False`` first and invert every ratio in the section.
+    """
+    path = tmp_path / "mmapdefault.jsonl"
+    write_jsonl(
+        path,
+        [
+            make_record(use_mmap=True, avg_ts=100.0, samples_ts=[100.0]),
+            make_record(use_mmap=False, avg_ts=94.0, samples_ts=[94.0]),
+        ],
+    )
+    contrasts = lb.contrast(lb.to_wide(lb.load_runs(path)), "use_mmap")
+    assert contrasts["baseline"].unique().tolist() == [True]
+    assert contrasts["level"].unique().tolist() == [False]
+    assert contrasts["ratio"].iloc[0] == pytest.approx(0.94)
+
+
+def test_a_swept_knob_is_held_fixed_by_other_contrasts(tmp_path):
+    """Once a knob is a factor, a contrast over another factor must hold it."""
+    path = tmp_path / "mmapkv.jsonl"
+    kv_pairs = [("f16/f16", "f16"), ("q8_0/q8_0", "q8_0")]
+    records = []
+    for mmap, (kv, kv_type) in product([True, False], kv_pairs):
+        value = 100.0 + 10 * (not mmap) + 5 * (kv != "f16/f16")
+        records.append(
+            make_record(
+                use_mmap=mmap,
+                bench_kv=kv,
+                type_k=kv_type,
+                type_v=kv_type,
+                avg_ts=value,
+                samples_ts=[value],
+            )
+        )
+    write_jsonl(path, records)
+    contrasts = lb.kv_contrast(lb.to_wide(lb.load_runs(path)))
+    assert set(contrasts["use_mmap"]) == {True, False}
+    assert len(contrasts) == 2, "one pair per mmap setting, not one averaged pair"
+
+
+def test_a_changed_machine_is_a_blocker(tmp_path):
+    """Different CPU means the records are not one study."""
+    path = tmp_path / "othermachine.jsonl"
+    write_jsonl(
+        path,
+        [make_record(), make_record(cpu_info="Some Other CPU", bench_depth=32768)],
+    )
+    assert severities(lb.load_runs(path))["machine"] == lb.BLOCKER
 
 
 def test_gpu_name_differing_by_driver_is_not_a_blocker(tmp_path):
@@ -401,7 +605,7 @@ def test_gpu_name_differing_by_driver_is_not_a_blocker(tmp_path):
             ),
         ],
     )
-    assert severities(lb.load_runs(path))["controlled fields"] == lb.OK
+    assert severities(lb.load_runs(path))["machine"] == lb.OK
 
 
 def test_duplicate_config_is_a_blocker(tmp_path):
@@ -443,6 +647,20 @@ def test_coverage_matrix_counts_two_tests_per_measured_cell(synthetic):
     assert set(matrix.to_numpy().ravel()) == {2}
 
 
+def test_study_log_carries_no_local_filesystem_paths(study_runs):
+    """The log is published, so it must not contain a home directory.
+
+    Appending fresh ``llama-bench`` output reintroduces absolute paths, so this
+    fails until ``python llmbench.py --scrub-paths`` has been run over it.
+    """
+    paths = study_runs["model_filename"].unique()
+    unscrubbed = [p for p in paths if not p.startswith(("hf://", "local://"))]
+    assert unscrubbed == [], (
+        f"{len(unscrubbed)} model path(s) still carry a filesystem location; "
+        "run: python llmbench.py --scrub-paths"
+    )
+
+
 def test_study_data_has_no_blockers(study_runs):
     """The real dataset must be free of blocking defects for the write-up to hold.
 
@@ -454,9 +672,19 @@ def test_study_data_has_no_blockers(study_runs):
 
 
 def test_study_data_carries_the_expected_caveats(study_runs):
+    """The two caveats the write-up is required to disclose.
+
+    Both are properties of how the runs were collected, so they hold until the
+    collection method changes — at which point the write-up must change too.
+    """
     checks = severities(study_runs)
     assert checks["replication"] == lb.CAVEAT
     assert checks["build provenance"] == lb.CAVEAT
-    assert checks["design balance"] == lb.CAVEAT
     assert checks["metric completeness"] == lb.OK
     assert checks["uniqueness"] == lb.OK
+
+
+def test_design_balance_verdict_tracks_the_measured_cells(study_runs):
+    """Asserted as an invariant, because the grid fills in as runs arrive."""
+    expected = lb.OK if lb.missing_cells(study_runs).empty else lb.CAVEAT
+    assert severities(study_runs)["design balance"] == expected

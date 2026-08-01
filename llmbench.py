@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import dataclass, field
 from itertools import product
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -27,23 +29,33 @@ import pandas as pd
 import seaborn as sns
 from matplotlib.ticker import FuncFormatter, LogLocator
 
+if TYPE_CHECKING:
+    from plotly import graph_objects as go
+
 # ---------------------------------------------------------------------------
 # Design constants
 # ---------------------------------------------------------------------------
 
-#: Harness-injected fields that together identify one configuration under test.
-CONFIG_COLS: list[str] = ["bench_model", "bench_backend", "bench_depth", "bench_kv"]
+#: Harness-injected fields that always identify a configuration.
+BENCH_COLS: list[str] = ["bench_model", "bench_backend", "bench_depth", "bench_kv"]
 
-#: Runtime knobs deliberately held fixed for the whole study. The audit fails
-#: loudly if any of these varies, because a varying value would silently confound
-#: the backend / KV-cache comparison.
+#: Harness fields that restate another factor rather than adding one.
 #:
-#: ``gpu_info`` is deliberately absent: both backends drive the same physical iGPU
-#: but report its name differently (``Radeon 8060S Graphics`` under ROCm,
-#: ``... (RADV STRIX_HALO)`` under the Vulkan RADV driver), so it is provenance
-#: rather than a controlled factor.
-CONTROLLED_FIELDS: list[str] = [
-    "cpu_info",
+#: ``bench_ctk`` / ``bench_ctv`` are the two halves of ``bench_kv``, and
+#: ``bench_block`` restates ``bench_depth``. Treating them as factors would not
+#: change the row count, but it would make the factorial design look mostly empty:
+#: 5 KV pairs would become 5 x 3 x 3 nominal cells with 40 of them impossible.
+#: :func:`design_factors` drops any field that is functionally determined by a
+#: factor already in the list, so this constant only documents the known cases.
+DERIVED_BENCH_COLS: list[str] = ["bench_ctk", "bench_ctv", "bench_block"]
+
+#: Runtime knobs that may legitimately be swept as an additional factor.
+#:
+#: A knob in this list is *not* required to be constant. Whichever ones vary in a
+#: given log are added to the configuration key by :func:`design_factors`, so the
+#: sweep is treated as part of the design rather than averaged over. Whichever
+#: ones are constant are reported as held fixed.
+SWEEPABLE_FIELDS: list[str] = [
     "n_batch",
     "n_ubatch",
     "n_threads",
@@ -56,6 +68,63 @@ CONTROLLED_FIELDS: list[str] = [
     "poll",
     "embeddings",
 ]
+
+#: Fields describing the machine, which must not change within one log.
+#:
+#: ``gpu_info`` is deliberately absent: both backends drive the same physical iGPU
+#: but report its name differently (``Radeon 8060S Graphics`` under ROCm,
+#: ``... (RADV STRIX_HALO)`` under the Vulkan RADV driver), so it is provenance
+#: rather than evidence the hardware changed.
+MACHINE_FIELDS: list[str] = ["cpu_info"]
+
+
+def _determines(runs: pd.DataFrame, source: str, target: str) -> bool:
+    """Whether each value of ``source`` implies exactly one value of ``target``."""
+    counts = runs.groupby(source, dropna=False)[target].nunique(dropna=False)
+    return bool(counts.le(1).all())
+
+
+def design_factors(runs: pd.DataFrame) -> list[str]:
+    """Columns that together identify one configuration in ``runs``.
+
+    Derived from the data rather than fixed in advance, so a newly swept knob is
+    picked up automatically and becomes a factor that contrasts hold fixed, rather
+    than a dimension the pivot silently averages over. In order:
+
+    1. The four core harness fields.
+    2. Any other varying ``bench_*`` field, since a harness that starts recording
+       a sweep of its own is recording a factor.
+    3. Any varying runtime knob from :data:`SWEEPABLE_FIELDS`.
+
+    A candidate is dropped when a factor already in the list determines it, which
+    is what keeps a restatement of an existing factor — ``bench_ctk`` against
+    ``bench_kv``, or a harness's ``bench_mmap`` against ``use_mmap`` — from being
+    counted twice and making the design look full of impossible cells.
+    """
+    # Only these are ever candidates. Scanning every column would also reach
+    # measurement columns, including the list-valued `samples_ts`.
+    candidates = [
+        col
+        for col in runs.columns
+        if col.startswith("bench_") and col not in (*BENCH_COLS, *DERIVED_BENCH_COLS)
+    ] + [col for col in SWEEPABLE_FIELDS if col in runs.columns]
+
+    factors = [*BENCH_COLS]
+    for candidate in candidates:
+        if runs[candidate].nunique(dropna=False) <= 1:
+            continue
+        if not any(_determines(runs, factor, candidate) for factor in factors):
+            factors.append(candidate)
+    return factors
+
+
+def held_fixed(runs: pd.DataFrame) -> list[str]:
+    """Sweepable knobs that are constant in ``runs``."""
+    return [
+        col
+        for col in SWEEPABLE_FIELDS
+        if col in runs.columns and runs[col].nunique(dropna=False) == 1
+    ]
 
 #: KV cache type pairs, ordered by the *kind* of change relative to the
 #: ``f16/f16`` baseline rather than alphabetically. Alphabetical order would place
@@ -72,8 +141,9 @@ KV_PAIRS: list[str] = [
 #: The reference KV configuration all KV contrasts are measured against.
 KV_BASELINE: str = "f16/f16"
 
-#: How each KV pair differs from the baseline. This grouping is the explanatory
-#: variable for the throughput cliffs observed in the study.
+#: How each KV pair differs from the baseline, as a description of the pair
+#: itself. Measurements are grouped by it because they separate along this line;
+#: the grouping asserts nothing about why.
 KV_CLASSES: dict[str, str] = {
     "f16/f16": "baseline f16 K, f16 V",
     "f16/q8_0": "asymmetric f16 K, quantized V",
@@ -127,6 +197,60 @@ def find_results(start: str | Path | None = None) -> Path:
         if results.is_file():
             return results
     raise FileNotFoundError(f"no {DEFAULT_RESULTS} found at or above {here}")
+
+
+#: Hugging Face cache layout: ``models--ORG--REPO/snapshots/REVISION/FILE.gguf``.
+_HF_CACHE = re.compile(
+    r"models--(?P<org>[^/]+?)--(?P<repo>[^/]+?)/snapshots/(?P<rev>[^/]+)/(?P<file>[^/]+)$"
+)
+
+
+def scrub_path(model_filename: str) -> str:
+    """Strip the local filesystem location from a model path.
+
+    ``llama-bench`` records the absolute path it loaded, which on a personal
+    machine contains a home directory and therefore a username. Only the location
+    is removed; the identity of the model is kept, since that is what the study is
+    about and what makes it reproducible:
+
+    * A Hugging Face cache path becomes ``hf://org/repo@revision/file.gguf``,
+      preserving which repository and which revision was loaded.
+    * Anything else keeps its filename only, as ``local://file.gguf``.
+
+    Idempotent, so it can be re-run over a log that is already partly scrubbed.
+    """
+    if model_filename.startswith(("hf://", "local://")):
+        return model_filename
+    match = _HF_CACHE.search(model_filename)
+    if match:
+        parts = match.groupdict()
+        return f"hf://{parts['org']}/{parts['repo']}@{parts['rev'][:12]}/{parts['file']}"
+    return f"local://{PurePosixPath(model_filename).name}"
+
+
+def scrub_log(path: str | Path) -> dict[str, str]:
+    """Rewrite ``path`` in place, removing local filesystem locations.
+
+    Returns the replacements applied. Values are substituted as text rather than
+    by re-serialising each record, so every other byte of the log — field order,
+    spacing, float formatting — is left exactly as ``llama-bench`` wrote it.
+    """
+    path = Path(path)
+    text = path.read_text()
+    originals = {
+        record["model_filename"]
+        for record in (json.loads(line) for line in text.splitlines() if line.strip())
+        if "model_filename" in record
+    }
+    replacements = {
+        original: scrub_path(original)
+        for original in originals
+        if scrub_path(original) != original
+    }
+    for original, scrubbed in replacements.items():
+        text = text.replace(json.dumps(original)[1:-1], json.dumps(scrubbed)[1:-1])
+    path.write_text(text)
+    return replacements
 
 
 def _test_type(record: dict) -> str:
@@ -206,13 +330,16 @@ def kv_order(frame: pd.DataFrame, column: str = "bench_kv") -> list[str]:
 def to_wide(runs: pd.DataFrame) -> pd.DataFrame:
     """Pivot tests into one row per configuration, one column per metric.
 
-    The prompt-processing and token-generation records for the same
-    ``(model, backend, depth, kv)`` become a single row, so a configuration can be
-    read as a point in (prefill, decode) space.
+    The prompt-processing and token-generation records for the same configuration
+    become a single row, so a configuration can be read as a point in
+    (prefill, decode) space. The row key is :func:`design_factors`, which includes
+    any swept runtime knob — averaging over a swept knob here would produce a
+    number belonging to no configuration that was actually run.
     """
+    factors = design_factors(runs)
     wide = (
         runs.pivot_table(
-            index=CONFIG_COLS,
+            index=factors,
             columns="test_type",
             values="t_s",
             aggfunc="mean",
@@ -222,8 +349,9 @@ def to_wide(runs: pd.DataFrame) -> pd.DataFrame:
     )
     ranks = {kv: i for i, kv in enumerate(kv_order(runs))}
     wide["_kv_rank"] = wide["bench_kv"].map(ranks)
+    sort_by = ["bench_model", "bench_backend", "bench_depth", "_kv_rank"]
     wide = (
-        wide.sort_values(["bench_model", "bench_backend", "bench_depth", "_kv_rank"])
+        wide.sort_values([*sort_by, *factors[len(BENCH_COLS) :]])
         .drop(columns="_kv_rank")
         .reset_index(drop=True)
     )
@@ -232,9 +360,16 @@ def to_wide(runs: pd.DataFrame) -> pd.DataFrame:
 
 
 def metric_columns(wide: pd.DataFrame) -> list[str]:
-    """Metric columns of a wide frame, prefill first then decode."""
-    extras = {*CONFIG_COLS, "kv_class"}
-    metrics = [column for column in wide.columns if column not in extras]
+    """Metric columns of a wide frame, prefill first then decode.
+
+    Identified by the naming :func:`_test_type` produces, so the set of factors
+    can grow without this needing to know about it.
+    """
+    metrics = [
+        column
+        for column in wide.columns
+        if isinstance(column, str) and column.startswith(("pp", "tg", "pg"))
+    ]
     return sorted(metrics, key=lambda metric: (not metric.startswith("pp"), metric))
 
 
@@ -328,16 +463,18 @@ def coverage_matrix(runs: pd.DataFrame) -> pd.DataFrame:
 
 def missing_cells(runs: pd.DataFrame) -> pd.DataFrame:
     """Cells of the full factorial design that carry no measurement."""
-    levels = {col: sorted(runs[col].unique()) for col in CONFIG_COLS}
-    measured = set(map(tuple, runs[CONFIG_COLS].to_numpy()))
+    factors = design_factors(runs)
+    levels = {col: sorted(runs[col].unique()) for col in factors}
+    measured = set(map(tuple, runs[factors].to_numpy()))
     absent = [combo for combo in product(*levels.values()) if combo not in measured]
-    return pd.DataFrame(absent, columns=CONFIG_COLS)
+    return pd.DataFrame(absent, columns=factors)
 
 
 def audit_runs(runs: pd.DataFrame) -> Audit:
     """Run every integrity check over a frame from :func:`load_runs`."""
     audit = Audit()
-    _check_controlled_fields(runs, audit)
+    _check_machine(runs, audit)
+    _check_factors(runs, audit)
     _check_replication(runs, audit)
     _check_build_provenance(runs, audit)
     _check_uniqueness(runs, audit)
@@ -347,20 +484,44 @@ def audit_runs(runs: pd.DataFrame) -> Audit:
     return audit
 
 
-def _check_controlled_fields(runs: pd.DataFrame, audit: Audit) -> None:
+def _check_machine(runs: pd.DataFrame, audit: Audit) -> None:
+    """The machine must be the same throughout; anything else is not one study."""
     varying = {
         col: sorted(map(str, runs[col].unique()))
-        for col in CONTROLLED_FIELDS
+        for col in MACHINE_FIELDS
         if col in runs.columns and runs[col].nunique() > 1
     }
     if varying:
         detail = "; ".join(f"{col}={vals}" for col, vals in varying.items())
-        audit.add(BLOCKER, "controlled fields", f"varies across runs: {detail}")
+        audit.add(BLOCKER, "machine", f"changes across runs: {detail}")
+    else:
+        audit.add(OK, "machine", f"identical across all {len(runs)} records")
+
+
+def _check_factors(runs: pd.DataFrame, audit: Audit) -> None:
+    """Report which knobs are being swept and which are constant.
+
+    A swept knob is part of the design, not a defect: it is added to the
+    configuration key so contrasts hold it fixed rather than averaging over it.
+    """
+    factors = design_factors(runs)
+    swept = factors[len(BENCH_COLS) :]
+    fixed = held_fixed(runs)
+    levels = ", ".join(f"{col}={runs[col].nunique()}" for col in factors)
+    if swept:
+        audit.add(
+            OK,
+            "factors",
+            f"{len(factors)} factors ({levels}); "
+            f"{', '.join(swept)} varies and is treated as a factor; "
+            f"{len(fixed)} other runtime knobs held constant",
+        )
     else:
         audit.add(
             OK,
-            "controlled fields",
-            f"all {len(CONTROLLED_FIELDS)} held constant across every run",
+            "factors",
+            f"{len(factors)} factors ({levels}); "
+            f"all {len(fixed)} other runtime knobs held constant",
         )
 
 
@@ -408,7 +569,7 @@ def _check_build_provenance(runs: pd.DataFrame, audit: Audit) -> None:
 
 
 def _check_uniqueness(runs: pd.DataFrame, audit: Audit) -> None:
-    keys = [*CONFIG_COLS, "test_type"]
+    keys = [*design_factors(runs), "test_type"]
     duplicated = runs[runs.duplicated(keys, keep=False)]
     if duplicated.empty:
         audit.add(OK, "uniqueness", "exactly one record per (config, test_type)")
@@ -454,7 +615,7 @@ def _check_design_balance(runs: pd.DataFrame, audit: Audit) -> None:
         audit.add(OK, "design balance", "design is fully crossed")
         return
     total = 1
-    for col in CONFIG_COLS:
+    for col in design_factors(runs):
         total *= runs[col].nunique()
     per_model = absent.groupby("bench_model").size().sort_values(ascending=False)
     audit.add(
@@ -476,15 +637,25 @@ def _check_design_balance(runs: pd.DataFrame, audit: Audit) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: The ``llama.cpp`` default for knobs whose default is not their sorted-first
+#: value. Used as the contrast baseline, so a swept knob reads as "what changing
+#: it away from the default did" rather than the reverse.
+KNOB_DEFAULTS: dict[str, object] = {"use_mmap": True, "flash_attn": 1}
+
+
 def _factor_levels(wide: pd.DataFrame, factor: str) -> list:
-    """Levels of ``factor`` in interpretable order."""
+    """Levels of ``factor`` in interpretable order, reference level first."""
     if factor == "bench_kv":
         return kv_order(wide)
+    present = set(wide[factor].unique())
     if factor == "bench_backend":
-        present = set(wide[factor].unique())
         known = [backend for backend in BACKENDS if backend in present]
         return known + sorted(present - set(known))
-    return sorted(wide[factor].unique())
+    levels = sorted(present)
+    default = KNOB_DEFAULTS.get(factor)
+    if default in present:
+        levels = [default, *(level for level in levels if level != default)]
+    return levels
 
 
 def contrast(
@@ -497,7 +668,7 @@ def contrast(
 
     Args:
         wide: Frame from :func:`to_wide`.
-        factor: The column to vary; one of :data:`CONFIG_COLS`.
+        factor: The column to vary; one of :func:`design_factors`.
         baseline: Reference level. Defaults to the first interpretable level.
         metrics: Metric columns to contrast. Defaults to all of them.
 
@@ -510,8 +681,9 @@ def contrast(
     Pairs where either side is missing are dropped rather than imputed, so the row
     count reflects what was genuinely measured.
     """
-    if factor not in CONFIG_COLS:
-        raise ValueError(f"{factor!r} is not a design factor; expected {CONFIG_COLS}")
+    factors = design_factors(wide)
+    if factor not in factors:
+        raise ValueError(f"{factor!r} is not a design factor; expected {factors}")
 
     levels = _factor_levels(wide, factor)
     if baseline is None:
@@ -520,7 +692,7 @@ def contrast(
         raise ValueError(f"baseline {baseline!r} not present; levels are {levels}")
 
     metrics = metrics or metric_columns(wide)
-    hold = [col for col in CONFIG_COLS if col != factor]
+    hold = [col for col in factors if col != factor]
 
     long = wide.melt(
         id_vars=[*hold, factor],
@@ -577,8 +749,9 @@ def depth_contrast(wide: pd.DataFrame, baseline: int | None = None) -> pd.DataFr
 def summarize(contrasts: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     """Median ratio and range per group, for reporting a spread not a point.
 
-    The median is used rather than the mean because throughput ratios here span
-    orders of magnitude when a configuration falls off a supported code path.
+    The median is used rather than the mean because the measured ratios span
+    roughly 0.01x to 90x, and a mean over that range is dominated by its
+    largest members.
     """
     return (
         contrasts.groupby(by, dropna=False)["ratio"]
@@ -610,8 +783,8 @@ def as_table(contrasts: pd.DataFrame, decimals: int = 1) -> pd.DataFrame:
 # earlier drafts of this analysis:
 #
 # * Throughput axes are logarithmic. Measured values span 6 to 753 t/s; on a
-#   linear axis pinned to the maximum, a config that falls off a supported code
-#   path becomes a flat line at the bottom and reads as "no data".
+#   linear axis pinned to the maximum, the smallest values flatten against the
+#   bottom of the plot and read as "no data".
 # * Ratios are plotted as log2 on a diverging colour scale, so a 2x speed-up and a
 #   2x slow-down are the same visual distance from parity.
 # ---------------------------------------------------------------------------
@@ -736,7 +909,7 @@ def plot_kv_sensitivity(wide: pd.DataFrame) -> plt.Figure:
         bbox_to_anchor=(0.5, -0.04),
     )
     fig.suptitle(
-        "Throughput by KV cache type — log scale, so collapses stay visible",
+        "Throughput by KV cache type — log scale, so small values stay readable",
         fontsize=13,
         fontweight="bold",
     )
@@ -781,9 +954,11 @@ def _attach_ratio_colorbar(fig: plt.Figure, ax: plt.Axes) -> None:
 
 
 def plot_backend_ratio(backend_contrasts: pd.DataFrame) -> plt.Figure:
-    """Vulkan / ROCm throughput ratio per configuration, one panel per metric.
+    """Per-configuration ratio between the two backend builds, one panel per metric.
 
-    Cells are annotated with the plain ratio; colour encodes ``log2(ratio)``.
+    Cells are annotated with the plain ratio; colour encodes ``log2(ratio)``. The
+    two builds are different commits, so a cell is a reading from two builds and
+    not an attribution to the backend.
     """
     metrics = sorted(backend_contrasts["metric"].unique())
     order = kv_order(backend_contrasts)
@@ -805,7 +980,8 @@ def plot_backend_ratio(backend_contrasts: pd.DataFrame) -> plt.Figure:
     baseline = backend_contrasts["baseline"].iloc[0]
     level = backend_contrasts["level"].iloc[0]
     fig.suptitle(
-        f"{level} relative to {baseline}, per configuration",
+        f"{level} build read against {baseline} build — different commits, "
+        "not a backend comparison",
         fontsize=13,
         fontweight="bold",
     )
@@ -918,6 +1094,93 @@ def plot_depth_scaling(depth_contrasts: pd.DataFrame) -> plt.Figure:
     return fig
 
 
+# ---------------------------------------------------------------------------
+# Interactive figures
+#
+# The static PNGs above are what the README embeds, since GitHub renders no
+# JavaScript. The published site uses these instead: with 4 models x 2 depths x
+# 2 backends on one axis, being able to isolate a series by clicking the legend
+# and read exact values on hover is the difference between a readable chart and
+# a thicket.
+# ---------------------------------------------------------------------------
+
+
+def to_long(wide: pd.DataFrame) -> pd.DataFrame:
+    """One row per (configuration, metric) — the shape plotting libraries want."""
+    factors = [*design_factors(wide), "kv_class"]
+    return wide.melt(
+        id_vars=[col for col in factors if col in wide.columns],
+        value_vars=metric_columns(wide),
+        var_name="metric",
+        value_name="t_s",
+    ).dropna(subset=["t_s"])
+
+
+def plot_throughput_interactive(wide: pd.DataFrame, height: int = 760) -> go.Figure:
+    """Throughput against KV cache type: one row per metric, one column per backend.
+
+    Colour separates models and dash style separates context depths, matching the
+    static figure. Hover reports every factor of the configuration, so a point can
+    be identified without cross-referencing the legend.
+    """
+    import plotly.express as px
+
+    long = to_long(wide)
+    factors = design_factors(wide)
+    hover = [col for col in factors if col not in {"bench_kv", "bench_model"}]
+
+    fig = px.line(
+        long,
+        x="bench_kv",
+        y="t_s",
+        color="bench_model",
+        line_dash="bench_depth",
+        facet_col="bench_backend",
+        facet_row="metric",
+        markers=True,
+        log_y=True,
+        height=height,
+        category_orders={
+            "bench_kv": kv_order(wide),
+            "metric": metric_columns(wide),
+            "bench_backend": _factor_levels(wide, "bench_backend"),
+        },
+        hover_data=hover,
+        labels={
+            "bench_kv": "KV cache type (K / V)",
+            "t_s": "tokens/second",
+            "bench_model": "model",
+            "bench_depth": "context depth",
+            "bench_backend": "backend",
+        },
+    )
+    # Each row is a different metric on a different scale; sharing one y range
+    # would flatten decode against the bottom of the prefill row.
+    fig.update_yaxes(matches=None, showticklabels=True)
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    fig.update_layout(
+        legend_title_text="model, depth",
+        margin={"l": 70, "r": 20, "t": 60, "b": 60},
+        hovermode="closest",
+        title=(
+            "Throughput by KV cache type — log axis; "
+            "click a legend entry to isolate a series"
+        ),
+    )
+    return fig
+
+
+def figure_html(fig: go.Figure) -> str:
+    """A plotly figure as a standalone HTML document.
+
+    Returned as a full document so it can be dropped into an ``iframe``, which is
+    the one embedding that renders both in the marimo editor and in the exported
+    static page. ``plotly.js`` is loaded from a CDN rather than inlined, which
+    keeps the built page around 3 MB rather than 40 MB.
+    """
+    return fig.to_html(full_html=True, include_plotlyjs="cdn")
+
+
 def render_figures(wide: pd.DataFrame, out: str | Path = DEFAULT_FIGURES) -> list[Path]:
     """Write every figure the write-up references, returning the paths written."""
     use_study_style()
@@ -945,12 +1208,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Refresh figures and summary tables.")
     parser.add_argument("--results", type=Path, default=None)
     parser.add_argument("--figures", type=Path, default=DEFAULT_FIGURES)
+    parser.add_argument(
+        "--scrub-paths",
+        action="store_true",
+        help="rewrite the log to remove local filesystem locations, then exit",
+    )
     args = parser.parse_args()
+
+    results = args.results or find_results(__file__)
+
+    if args.scrub_paths:
+        replacements = scrub_log(results)
+        for original, scrubbed in replacements.items():
+            print(f"{original}\n  -> {scrubbed}")
+        print(f"\n{len(replacements)} path(s) rewritten in {results}")
+        return
 
     mpl.use("Agg")
     pd.set_option("display.width", 200)
 
-    runs = load_runs(args.results or find_results(__file__))
+    runs = load_runs(results)
     wide = to_wide(runs)
 
     span = f"{runs['test_time'].min()} .. {runs['test_time'].max()}"
@@ -959,7 +1236,7 @@ def main() -> None:
     print(audit_runs(runs), "\n")
 
     summaries = {
-        "Vulkan / ROCm, grouped by KV class": summarize(
+        "The two builds read against each other (not a backend comparison)": summarize(
             backend_contrast(wide), ["metric", "kv_class"]
         ),
         "Quantised KV vs f16/f16, per backend": summarize(
